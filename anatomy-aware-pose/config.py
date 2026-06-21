@@ -1,5 +1,4 @@
-"""Globals: percorsi dataset, iperparametri, seed, device.
-Sezione 'Globals' della struttura richiesta dalla prof.
+"""Globals: percorsi dataset, iperparametri, seed, device. Sezione 'Globals' della struttura richiesta dalla prof.
 """
 import random
 import numpy as np
