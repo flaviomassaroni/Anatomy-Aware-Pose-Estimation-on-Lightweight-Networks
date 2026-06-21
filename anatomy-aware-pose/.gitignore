@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Dataset e annotazioni pesanti (stanno su Kaggle, MAI su Git)
+data/
+datasets/
+*.zip
+
+# Checkpoint / pesi / output (stanno su Kaggle, NON su Git)
+*.pth
+*.ckpt
+checkpoints/
+eval_results/
+*_pred.json
+history.csv
