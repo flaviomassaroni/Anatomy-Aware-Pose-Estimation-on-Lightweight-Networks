@@ -19,10 +19,12 @@
 7. [Training](#7-training)
 8. [Evaluation Pipeline — Step by Step](#8-evaluation-pipeline--step-by-step)
 9. [Anatomical Violation Rate (AVR)](#9-anatomical-violation-rate-avr)
-10. [Still To Implement](#10-still-to-implement)
-11. [How to Run](#11-how-to-run)
-12. [Reproducibility](#12-reproducibility)
-13. [References](#13-references)
+10. [Baseline Results](#10-baseline-results)
+11. [Skeletal Topology Loss (STL) — Implementation](#11-skeletal-topology-loss-stl--implementation)
+12. [Still To Do](#12-still-to-do)
+13. [How to Run](#13-how-to-run)
+14. [Reproducibility](#14-reproducibility)
+15. [References](#15-references)
 
 ---
 
@@ -93,15 +95,18 @@ The code follows the structure required by the professor:
 **Imports → Globals → Utils → Data → Network → Train → Evaluation**
 
 ```
-├── config.py              # Globals: paths, hyperparameters, seed, device
-├── utils.py               # Utils: heatmap generation/decoding, coordinate transforms
-├── data.py                # Data: COCO/OCHuman parsing, Dataset classes
-├── network.py             # Network: MobileNetV3 + DeconvHead
-├── train.py               # Train: WeightedMSELoss, training loop, checkpointing
-├── evaluation.py          # Evaluation: inference, AP/AR, AVR, COCO/OCHuman wrappers
-├── kaggle_runner.ipynb    # Minimal notebook that clones the repo and runs everything
-├── .gitignore             # Excludes datasets, checkpoints, __pycache__
-└── README.md              # This file
+├── config.py                        # Globals: paths, hyperparameters, seed, device
+├── utils.py                         # Utils: heatmap generation/decoding, coordinate transforms
+├── data.py                          # Data: COCO/OCHuman parsing, Dataset classes
+├── network.py                       # Network: MobileNetV3 + DeconvHead
+├── train.py                         # Train: WeightedMSELoss, training loop, checkpointing
+├── evaluation.py                    # Evaluation: inference, AP/AR, AVR, COCO/OCHuman wrappers
+├── anthropometric_constraints.py    # Anthropometric ranges from biomechanical literature
+├── stl.py                           # Skeletal Topology Loss (soft-argmax + 3 differentiable terms)
+├── test_stl.py                      # Differentiability tests (gradcheck) for all STL components
+├── kaggle_runner.ipynb              # Minimal notebook that clones the repo and runs everything
+├── .gitignore
+└── README.md
 ```
 
 **Workflow:** GitHub is the single source of truth for code. Kaggle is only the
@@ -476,8 +481,9 @@ the other, which is anatomically impossible.
 
 **Note:** this current implementation checks **left/right symmetry**, not
 absolute anthropometric ratios (e.g. forearm/upper-arm should be in
-[0.71, 0.85]). The absolute ratio constraints are part of the **STL**
-(still to implement) and will use citable biomechanical sources.
+[0.55, 1.05]). The absolute ratio constraints are in the **STL** (see
+Section 10) and use citable biomechanical sources (Winter 2009, Drillis
+& Contini 1966).
 
 #### Joint angle violations (`joint_angle`)
 
@@ -512,104 +518,194 @@ anatomically meaningless.
 - `AVR_mean_violations`: average number of violations per pose
 - `per_category`: breakdown by type (bone_ratio, joint_angle, collapse)
 
-**Expected baseline behavior:** the baseline (no STL) should have a
-non-negligible AVR, especially on OCHuman where occlusion is heavy. After
-adding the STL, the AVR should drop — this is the main result we are after.
+**Baseline behavior (measured):** the baseline (no STL) has AVR = 30.6% on
+COCO val and AVR = 48.2% on OCHuman — confirming that occlusion drives
+anatomical violations. After adding the STL, the AVR should drop
+significantly; this is the main result we are after.
 
 ---
 
-## 10. Still To Implement
+## 10. Baseline Results
 
-### 10.1 Skeletal Topology Loss (STL) — the core contribution
+Training: 30 epochs, MobileNetV3-Small, heatmap MSE loss, Adam lr=1e-3 with
+MultiStepLR (drops ×0.1 at epochs 15, 25). Best val_loss at epoch 16.
 
-The STL is a differentiable multi-term loss that replaces the AVR's hard-coded
-violation checks with smooth, gradient-friendly penalties that the model can
-learn from during training.
+| Metric | COCO val | OCHuman (zero-shot) |
+|--------|----------|---------------------|
+| AP     | 0.498    | 0.436               |
+| AP@.50 | 0.777    | 0.779               |
+| AP@.75 | 0.532    | 0.433               |
+| AR     | 0.538    | 0.523               |
+| **AVR rate** | **0.306** | **0.482**      |
+| **AVR mean** | **0.405** | **0.694**      |
 
-**Critical prerequisite: soft-argmax.** The STL operates on keypoint
-*coordinates*, but the model outputs *heatmaps*. The `argmax` used in
-evaluation is not differentiable, so we need a differentiable alternative:
+Key observations:
+- AP@.50 is nearly identical between COCO (0.777) and OCHuman (0.779) — the
+  keypoints are roughly in the right place even under heavy occlusion.
+- But the **AVR doubles** from 30.6% to 48.2% — almost half of all predicted
+  poses on OCHuman have at least one anatomical violation.
+- This confirms the core thesis: AP alone does not capture anatomical
+  plausibility. A robot trusting these poses would plan unsafe trajectories.
+
+---
+
+## 11. Skeletal Topology Loss (STL) — Implementation
+
+The STL is implemented in `stl.py` with anthropometric ranges in
+`anthropometric_constraints.py`. All terms pass `torch.autograd.gradcheck`
+(verified in `test_stl.py`).
+
+### 11.1 Soft-Argmax — the bridge between heatmaps and coordinates
+
+The model outputs heatmaps `[B, 17, 64, 48]`, but the STL needs coordinates.
+The standard `argmax` is not differentiable (zero gradient everywhere). The
+**soft-argmax** (Sun et al., "Integral Human Pose Regression", ECCV 2018)
+computes the expected position instead:
+
+```
+p(i,j) = softmax(β · h(i,j))        ← normalize to probability distribution
+x̂ = Σ_j  j · Σ_i p(i,j)            ← expected column
+ŷ = Σ_i  i · Σ_j p(i,j)            ← expected row
+```
+
+**Temperature β = 10.** With our Gaussian heatmaps (σ=2, peak ≈ 1.0):
+- β = 1: softmax too flat → coordinates collapse to center → useless
+- β = 100: softmax too sharp → near-delta → vanishing gradients
+- β = 10: precise coordinates (error < 0.2 px) AND healthy gradients
+
+### 11.2 Term 1: Bone Ratio Loss
+
+Two sub-terms:
+
+**(a) Inter-segment ratios** (3 rules × 2 sides = 6 checks). For each
+anatomical ratio (e.g. forearm/upper-arm), compute from predicted coordinates
+and penalize if outside the anthropometric range:
+
+```
+ratio = ‖elbow - wrist‖ / ‖shoulder - elbow‖
+L = max(0, r_min - ratio)² + max(0, ratio - r_max)²
+```
+
+Ranges from Winter 2009 / Drillis & Contini 1966:
+
+| Ratio | Nominal | Range |
+|-------|---------|-------|
+| Forearm / Upper arm | 0.785 | [0.55, 1.05] |
+| Shank / Thigh | 1.004 | [0.70, 1.35] |
+| Upper arm / Thigh | 0.759 | [0.50, 1.05] |
+
+Ranges are generous (nominal ± ~30%) to absorb individual variability and 2D
+foreshortening.
+
+**(b) Left/right symmetry** (4 checks). Same bone on left vs right side:
+ratio must stay in [0.65, 1.55].
+
+### 11.3 Term 2: Joint Angle Loss
+
+8 joints checked (elbow, knee, shoulder, hip — left and right). The angle at
+each joint vertex is computed with **atan2**, not arccos:
 
 ```python
-def soft_argmax(heatmaps):
-    """[B, K, H, W] → [B, K, 2] differentiable coordinates."""
-    B, K, H, W = heatmaps.shape
-    softmax = F.softmax(heatmaps.view(B, K, -1), dim=-1).view(B, K, H, W)
-    grid_x = torch.arange(W, device=heatmaps.device).float()
-    grid_y = torch.arange(H, device=heatmaps.device).float()
-    x = (softmax.sum(dim=2) * grid_x).sum(dim=-1)  # [B, K]
-    y = (softmax.sum(dim=3) * grid_y).sum(dim=-1)  # [B, K]
-    return torch.stack([x, y], dim=-1)              # [B, K, 2]
+cross = v1.x * v2.y - v1.y * v2.x    # 2D cross product (scalar)
+dot   = v1 · v2                        # dot product
+angle = atan2(|cross|, dot)            # stable in [0, π]
 ```
 
-**Three terms to implement:**
+**Why atan2 instead of arccos?** arccos has derivative −1/√(1−cos²θ), which
+explodes at θ = 0 and θ = π — exactly the boundaries of our physiological
+range. atan2 has stable derivatives everywhere.
 
-1. **Bone ratio term** — for each anatomical bone (defined as pairs of
-   keypoints), compute the predicted length, divide by a reference length
-   (e.g. torso), and penalize if the ratio falls outside the anthropometric
-   range from biomechanical literature.
-   - Sources needed: Winter (2009) "Biomechanics and Motor Control of Human
-     Movement", Drillis & Contini (1966) segment ratios.
-   - Must be **citable** — this is the claim that differentiates us from Han
-     et al. (who learn their ranges from data).
+Ranges from AAOS 1965 / Winter 2009, with generous minimums (10°–15°) to
+absorb 2D foreshortening.
 
-2. **Joint angle term** — compute the angle at each joint via the
-   differentiable `atan2`-based formula (NOT the arccos used in AVR, which has
-   gradient issues at 0° and 180°). Penalize if outside the physiological
-   range from biomechanical literature.
+### 11.4 Term 3: Geometric Ordering Loss
 
-3. **Geometric ordering term** — model the skeleton as a kinematic tree.
-   For each chain (e.g. hip→knee→ankle), ensure the intermediate joint lies
-   *between* the extremes along the chain direction. Implemented as a soft
-   penalty on the projection.
+4 kinematic chains (left/right arm, left/right leg). For each chain
+(a → mid → b), the intermediate joint must project between the extremes:
 
-**Combined loss:**
 ```
-L_total = L_heatmap + λ_bone × L_bone + λ_angle × L_angle + λ_order × L_order
+t = dot(mid − a, b − a) / ‖b − a‖²
+L = max(0, −t)² + max(0, t − 1)²
 ```
 
-The λ weights need tuning via grid search on a validation subset.
+`t ∈ [0,1]` means mid is between a and b → zero penalty.
+`t < 0` or `t > 1` → mid is outside the chain → quadratic penalty.
 
-**Differentiability test:** every term must pass `torch.autograd.gradcheck` on
-a small synthetic input before being used in training.
+### 11.5 Combined Loss
 
-### 10.2 Grad-CAM explainability
+```
+L_total = L_heatmap + λ_bone · L_bone + λ_angle · L_angle + λ_order · L_order
+```
+
+The `SkeletalTopologyLoss` class in `stl.py` wraps all terms and returns both
+the total loss and a per-term breakdown dict for logging.
+
+### 11.6 Design Choices Summary
+
+| Choice | Why |
+|--------|-----|
+| Soft-argmax β=10 | Balances precision and gradient flow for σ=2 heatmaps |
+| atan2 not arccos | Stable gradients at range boundaries (0° and 180°) |
+| Hinge loss² | Zero inside range, smooth outside (no derivative discontinuity) |
+| √(x² + ε) | Prevents infinite gradient when bone length → 0 |
+| Ranges ± 30% | Absorbs individual variability + 2D foreshortening |
+| Absolute not statistical | Key differentiator from Han et al. (2025) |
+
+### 11.7 Differentiability Verification
+
+`test_stl.py` runs `torch.autograd.gradcheck` on every component:
+
+```
+$ python test_stl.py
+
+soft_argmax                    OK
+bone_ratio_loss                OK
+joint_angle_loss               OK
+geometric_ordering             OK
+combined_e2e                   OK
+
+All tests passed. STL is differentiable and ready for training.
+```
+
+---
+
+## 12. Still To Do
+
+### 12.1 STL Training + λ Tuning
+
+Fine-tune from the baseline `best.pth` with `SkeletalTopologyLoss`. Start
+with λ_bone = λ_angle = λ_order = 0.5, then grid search on a validation
+subset. 10-15 epochs should suffice (backbone already converged).
+
+### 12.2 Grad-CAM Explainability
 
 Grad-CAM on the last convolutional layer of the backbone, targeting specific
-keypoint channels. The goal: verify that when a keypoint is occluded, the
-model looks at *neighboring visible joints* to infer its position (evidence
-that the STL is teaching anatomical reasoning), rather than hallucinating.
+keypoint channels. Compare baseline vs STL on occluded examples: does the STL
+model attend to neighboring visible joints?
 
-Compare Grad-CAM visualizations between baseline (no STL) and STL model on
-the same occluded examples.
+### 12.3 Ablation Study
 
-### 10.3 Ablation study
-
-Required by the project specification. Four configurations:
-1. Heatmap loss only (baseline) — already training
-2. Heatmap + bone ratio term
+Four configurations (required by project spec):
+1. Heatmap loss only (baseline) — done
+2. Heatmap + bone ratio
 3. Heatmap + bone ratio + joint angle
 4. Full STL (all three terms)
 
-For each: AP, AR, AVR on both COCO val and OCHuman zero-shot. Plus λ
-sensitivity analysis (how AP/AVR trade off as λ increases).
+Plus λ sensitivity analysis (trade-off AP vs AVR).
 
-### 10.4 Inference benchmark
+### 12.4 Inference Benchmark
 
-Measure inference time (ms/image) on CPU and GPU. Compare with ViTPose and
-HRNet. Count FLOPs with `thop` or `fvcore`. This justifies the lightweight
-backbone choice.
+Measure ms/image on CPU and GPU. Compare with ViTPose and HRNet. Count FLOPs
+with `thop` or `fvcore`.
 
-### 10.5 Paper and presentation
+### 12.5 Paper and Presentation
 
-- ICRA/IROS format: Introduction, Related Work, Methodology (STL equations),
-  Experiments, Results, Conclusions
-- 15-20 slides for the exam
-- Failure case analysis: side-by-side baseline vs STL on occluded poses
+ICRA/IROS format. 15-20 slides for the exam. Failure case analysis with
+side-by-side visualizations.
 
 ---
 
-## 11. How to Run
+## 13. How to Run
 
 ### On Kaggle (training + evaluation)
 
@@ -640,7 +736,7 @@ git add . && git commit -m "description" && git push
 
 ---
 
-## 12. Reproducibility
+## 14. Reproducibility
 
 - Seed: `SEED = 42`, applied to `random`, `numpy`, `torch`, `torch.cuda`,
   `cudnn.deterministic = True`, `cudnn.benchmark = False`
@@ -652,7 +748,7 @@ git add . && git commit -m "description" && git push
 
 ---
 
-## 13. References
+## 15. References
 
 1. **ViTPose** — Xu et al., "ViTPose: Simple Vision Transformer Baselines for
    Human Pose Estimation", NeurIPS 2022
@@ -668,7 +764,10 @@ git add . && git commit -m "description" && git push
 6. **SimpleBaseline** — Xiao et al., "Simple Baselines for Human Pose
    Estimation and Tracking", ECCV 2018 (deconv head design, sub-pixel
    refinement)
+7. **Integral Pose** — Sun et al., "Integral Human Pose Regression",
+   ECCV 2018 (soft-argmax / integral regression)
 
-### Biomechanical sources (to be added for STL)
+### Biomechanical sources
 - Winter, D.A. "Biomechanics and Motor Control of Human Movement", 4th ed., Wiley, 2009
-- Drillis, R. & Contini, R. "Body Segment Parameters", Technical Report, NYU, 1966
+- Drillis, R. & Contini, R. "Body Segment Parameters", Technical Report No. 1166-03, NYU, 1966
+- American Academy of Orthopaedic Surgeons (AAOS), "Joint Motion: Method of Measuring and Recording", 1965
