@@ -24,6 +24,48 @@ from anthropometric_constraints import (
 
 
 # ===================================================================
+# SCALA DELLA PENALITA' BONE-RATIO (log-cosh)
+# ===================================================================
+#
+# I rapporti inter-segmentali (avambraccio/braccio, gamba/coscia, ...)
+# confrontano segmenti DIVERSI, che in proiezione 2D monoculare possono
+# subire foreshortening INDIPENDENTE. Un rapporto 3D nominale (Winter)
+# di 0.785 puo' quindi apparire, in 2D, ovunque tra ~0.20 e ~3.0 in modo
+# perfettamente legittimo (un segmento puntato verso la camera a 75 gradi
+# si proietta a cos(75 gradi) ~ 0.26 della lunghezza reale).
+#
+# Una hinge a confini netti penalizza tutto questo foreshortening come se
+# fosse un errore -> esplode (L_bone ~ 37 nei nostri test) e domina il
+# gradiente con pochi outlier. Usiamo invece una penalita' log-cosh
+# centrata sul LOG del rapporto nominale di Winter:
+#
+#   pen(ratio) = logcosh( ( log(ratio) - log(nominale) ) / BONE_SCALE )
+#
+# Perche' lo spazio log: rende simmetrica la penalita' tra un rapporto e
+# il suo reciproco (2x e 0.5x "sbagliano uguale"), coerente col fatto che
+# il foreshortening accorcia e allunga con la stessa probabilita'.
+#
+# Perche' BONE_SCALE = 1.35: e' la distanza in spazio log dal nominale al
+# confine di foreshortening geometricamente atteso. Per qualunque coppia,
+# log(nom / (nom*cos75)) = log(1/cos75) = log(1/0.259) ~ 1.35. E' UN solo
+# parametro geometrico (dipende solo da cos(75 gradi)), non tarato sul
+# dataset: dentro l'intervallo di foreshortening atteso la penalita' resta
+# trascurabile, oltre cresce. Vedi anthropometric_constraints.py 'range'
+# (ora documentazione del foreshortening atteso, non piu' confini hinge).
+BONE_SCALE = 1.35
+
+
+def _logcosh(x):
+    """log(cosh(x)) numericamente stabile (no overflow per |x| grande).
+
+    Per |x| grande, log(cosh(x)) ~ |x| - log(2): si comporta come L1
+    (robusto agli outlier). Per |x| piccolo ~ x^2/2: si comporta come L2
+    (liscio, gradiente ben definito al centro).
+    """
+    return x + F.softplus(-2.0 * x) - math.log(2.0)
+
+
+# ===================================================================
 # SOFT-ARGMAX (differenziabile, sostituisce argmax in training)
 # ===================================================================
 #
@@ -127,20 +169,34 @@ def _joint_angle(coords, kp_a, kp_joint, kp_b):
 #   penalty = max(0, r_min - ratio)^2 + max(0, ratio - r_max)^2
 
 def bone_ratio_loss(coords):
-    """Penalizza rapporti ossei fuori range antropometrico.
+    """Penalizza rapporti ossei non plausibili.
 
     coords: [B, K, 2] coordinate da soft-argmax
+
+    Due sotto-termini con forme DIVERSE, ciascuna giustificata dalla fisica:
+      a) Rapporti inter-segmentali -> log-cosh sul log-rapporto centrato sul
+         nominale di Winter. Confrontano segmenti diversi, soggetti a
+         foreshortening indipendente -> serve una penalita' robusta che
+         tolleri la varianza di proiezione (vedi BONE_SCALE sopra).
+      b) Simmetria sx/dx -> hinge quadratica. Confronta lo STESSO segmento
+         sui due lati: il foreshortening e' in gran parte condiviso (assunta
+         co-planarita' approssimata dei due lati), quindi devia da 1 solo
+         per errori di stima sotto occlusione -> la hinge ha senso fisico.
+         (Limite noto: pose di profilo estremo rompono la co-planarita'; il
+         margine largo del range [0.65, 1.55] assorbe la maggior parte dei
+         casi. Da rivedere solo se la per_category AVR segnala un problema.)
 
     Ritorna: scalare (media su batch e su tutte le regole)
     """
     losses = []
 
-    # --- a) Rapporti inter-segmentali (3 regole, ciascuna su sx E dx) ---
+    # --- a) Rapporti inter-segmentali: log-cosh (3 regole, sx E dx) ---
     # In anthropometric_constraints.py i keypoint sono definiti per il lato
     # sinistro. Per il destro, gli indici COCO sono sempre +1
     # (es. left_shoulder=5, right_shoulder=6).
     for name, rule in BONE_RATIOS.items():
-        r_min, r_max = rule['range']
+        nominal = rule['nominal']
+        log_nom = math.log(nominal)
         num_a, num_b = rule['numerator']
         den_a, den_b = rule['denominator']
 
@@ -149,12 +205,13 @@ def bone_ratio_loss(coords):
             len_den = _bone_length(coords, den_a + side_offset, den_b + side_offset)
             ratio = len_num / (len_den + 1e-6)  # [B]
 
-            # Hinge loss quadratica: zero se ratio in [r_min, r_max]
-            below = F.relu(r_min - ratio)   # > 0 se ratio < r_min
-            above = F.relu(ratio - r_max)   # > 0 se ratio > r_max
-            losses.append((below ** 2 + above ** 2).mean())
+            # log-cosh centrato sul nominale di Winter, scala geometrica.
+            # +1e-6 dentro il log evita log(0) se un segmento collassa.
+            log_ratio = torch.log(ratio + 1e-6)
+            z = (log_ratio - log_nom) / BONE_SCALE
+            losses.append(_logcosh(z).mean())
 
-    # --- b) Simmetria sx/dx (4 regole) ---
+    # --- b) Simmetria sx/dx: hinge quadratica (4 regole) ---
     s_min, s_max = SYMMETRY_RANGE
     for (left_a, left_b), (right_a, right_b), _ in SYMMETRY_PAIRS:
         len_left = _bone_length(coords, left_a, left_b)
