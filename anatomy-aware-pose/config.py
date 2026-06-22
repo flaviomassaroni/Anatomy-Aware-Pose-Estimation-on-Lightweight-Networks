@@ -33,9 +33,9 @@ COCO_VAL_ANN   = f'{COCO_ROOT}/annotations/person_keypoints_val2017.json'
 # --- Path OCHuman (dataset Kaggle condiviso) ---
 # ATTENZIONE: dopo aver montato il dataset nel runner, verifica lo slug reale
 # con la cella os.walk. Se il path non corrisponde, correggi QUI e fai push.
-OCHUMAN_IMG      = '/kaggle/input/ochuman/images/images'
-OCHUMAN_VAL_ANN  = '/kaggle/input/ochuman/ochuman_coco_format_val_range_0.00_1.00.json'
-OCHUMAN_TEST_ANN = '/kaggle/input/ochuman/ochuman_coco_format_test_range_0.00_1.00.json'
+OCHUMAN_IMG      = '/kaggle/input/datasets/messinaalberto/ochuman/images/images'
+OCHUMAN_VAL_ANN  = '/kaggle/input/datasets/messinaalberto/ochuman/ochuman_coco_format_val_range_0.00_1.00.json'
+OCHUMAN_TEST_ANN = '/kaggle/input/datasets/messinaalberto/ochuman/ochuman_coco_format_test_range_0.00_1.00.json'
 
 # --- Output (resta su Kaggle, NON su Git) ---
 CHECKPOINT_DIR = '/kaggle/working/checkpoints'
