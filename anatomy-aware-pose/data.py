@@ -13,6 +13,9 @@ from pycocotools.coco import COCO
 
 from utils import generate_heatmap
 
+import cv2
+cv2.setNumThreads(0)  # evita thread contention con DataLoader num_workers > 0
+
 
 def build_samples(ann_file, min_keypoints=1, min_bbox_area=32 * 32):
     """Una persona = un esempio. Filtra pose con troppo pochi keypoint o bbox degeneri.

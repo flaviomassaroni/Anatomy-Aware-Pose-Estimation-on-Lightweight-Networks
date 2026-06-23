@@ -168,7 +168,20 @@ def _joint_angle(coords, kp_a, kp_joint, kp_b):
 # Penalita': hinge loss al quadrato (smooth, zero dentro il range):
 #   penalty = max(0, r_min - ratio)^2 + max(0, ratio - r_max)^2
 
-def bone_ratio_loss(coords):
+def _kp_valid(valid_mask, *kp_indices):
+    """Ritorna [B] mask: 1.0 se TUTTI i keypoint indicati sono validi, 0.0 altrimenti."""
+    mask = torch.ones(valid_mask.shape[0], device=valid_mask.device)
+    for kp in kp_indices:
+        mask = mask * valid_mask[:, kp]
+    return mask
+
+
+def _masked_mean(per_sample_loss, mask):
+    """Media pesata dalla mask. Se nessun sample e' valido, ritorna 0."""
+    return (per_sample_loss * mask).sum() / (mask.sum() + 1e-6)
+
+
+def bone_ratio_loss(coords, valid_mask):
     """Penalizza rapporti ossei non plausibili.
 
     coords: [B, K, 2] coordinate da soft-argmax
@@ -201,26 +214,34 @@ def bone_ratio_loss(coords):
         den_a, den_b = rule['denominator']
 
         for side_offset in [0, 1]:  # 0=sinistro, 1=destro
-            len_num = _bone_length(coords, num_a + side_offset, num_b + side_offset)
-            len_den = _bone_length(coords, den_a + side_offset, den_b + side_offset)
+            na, nb = num_a + side_offset, num_b + side_offset
+            da, db = den_a + side_offset, den_b + side_offset
+            mask = _kp_valid(valid_mask, na, nb, da, db)
+
+            len_num = _bone_length(coords, na, nb)
+            len_den = _bone_length(coords, da, db)
             ratio = len_num / (len_den + 1e-6)  # [B]
 
             # log-cosh centrato sul nominale di Winter, scala geometrica.
             # +1e-6 dentro il log evita log(0) se un segmento collassa.
             log_ratio = torch.log(ratio + 1e-6)
             z = (log_ratio - log_nom) / BONE_SCALE
-            losses.append(_logcosh(z).mean())
+            losses.append(_masked_mean(_logcosh(z), mask))
 
-    # --- b) Simmetria sx/dx: hinge quadratica (4 regole) ---
+    # --- b) Simmetria sx/dx: hinge quadratica con clamp (4 regole) ---
+    SYMMETRY_CAP = 4.0  # oltre il cap la posa e' irrecuperabile, satura
     s_min, s_max = SYMMETRY_RANGE
     for (left_a, left_b), (right_a, right_b), _ in SYMMETRY_PAIRS:
+        mask = _kp_valid(valid_mask, left_a, left_b, right_a, right_b)
+
         len_left = _bone_length(coords, left_a, left_b)
         len_right = _bone_length(coords, right_a, right_b)
         ratio = len_left / (len_right + 1e-6)  # [B]
 
         below = F.relu(s_min - ratio)
         above = F.relu(ratio - s_max)
-        losses.append((below ** 2 + above ** 2).mean())
+        penalty = torch.clamp(below ** 2 + above ** 2, max=SYMMETRY_CAP)
+        losses.append(_masked_mean(penalty, mask))
 
     if not losses:
         return torch.tensor(0.0, device=coords.device)
@@ -239,28 +260,29 @@ def bone_ratio_loss(coords):
 #   quando theta -> 0 o theta -> pi (esattamente i confini del range!).
 #   atan2(|sin_theta|, cos_theta) ha derivata stabile ovunque.
 
-def joint_angle_loss(coords):
+def joint_angle_loss(coords, valid_mask):
     """Penalizza angoli articolari fuori range fisiologico.
 
-    coords: [B, K, 2] coordinate da soft-argmax
+    coords:     [B, K, 2] coordinate da soft-argmax
+    valid_mask: [B, K]     1.0 per keypoint validi
 
-    Ritorna: scalare (media su batch e su tutte le regole)
+    Ritorna: scalare (media su batch e su tutte le regole valide)
     """
     losses = []
 
     for name, rule in JOINT_ANGLE_RANGES.items():
         kp_a, kp_joint, kp_b = rule['joints']
         deg_min, deg_max = rule['range_deg']
+        mask = _kp_valid(valid_mask, kp_a, kp_joint, kp_b)
 
-        # Converti range in radianti
         rad_min = math.radians(deg_min)
         rad_max = math.radians(deg_max)
 
-        angle = _joint_angle(coords, kp_a, kp_joint, kp_b)  # [B], radianti
+        angle = _joint_angle(coords, kp_a, kp_joint, kp_b)
 
         below = F.relu(rad_min - angle)
         above = F.relu(angle - rad_max)
-        losses.append((below ** 2 + above ** 2).mean())
+        losses.append(_masked_mean(below ** 2 + above ** 2, mask))
 
     if not losses:
         return torch.tensor(0.0, device=coords.device)
@@ -281,27 +303,30 @@ def joint_angle_loss(coords):
 #
 # Penalita': max(0, -t)^2 + max(0, t - 1)^2
 
-def geometric_ordering_loss(coords):
+def geometric_ordering_loss(coords, valid_mask):
     """Penalizza giunti fuori ordine lungo le catene cinematiche.
 
-    coords: [B, K, 2] coordinate da soft-argmax
+    coords:     [B, K, 2] coordinate da soft-argmax
+    valid_mask: [B, K]     1.0 per keypoint validi
 
-    Ritorna: scalare (media su batch e su tutte le catene)
+    Ritorna: scalare (media su batch e catene valide)
     """
     losses = []
 
     for kp_a, kp_mid, kp_b, _ in KINEMATIC_CHAINS:
-        a   = coords[:, kp_a, :]    # [B, 2]
-        mid = coords[:, kp_mid, :]  # [B, 2]
-        b   = coords[:, kp_b, :]    # [B, 2]
+        mask = _kp_valid(valid_mask, kp_a, kp_mid, kp_b)
 
-        ab = b - a                                      # [B, 2]
-        am = mid - a                                    # [B, 2]
-        t = (am * ab).sum(dim=-1) / ((ab ** 2).sum(dim=-1) + 1e-6)  # [B]
+        a   = coords[:, kp_a, :]
+        mid = coords[:, kp_mid, :]
+        b   = coords[:, kp_b, :]
 
-        below = F.relu(-t)          # > 0 se t < 0
-        above = F.relu(t - 1.0)    # > 0 se t > 1
-        losses.append((below ** 2 + above ** 2).mean())
+        ab = b - a
+        am = mid - a
+        t = (am * ab).sum(dim=-1) / ((ab ** 2).sum(dim=-1) + 1e-6)
+
+        below = F.relu(-t)
+        above = F.relu(t - 1.0)
+        losses.append(_masked_mean(below ** 2 + above ** 2, mask))
 
     if not losses:
         return torch.tensor(0.0, device=coords.device)
@@ -347,10 +372,16 @@ class SkeletalTopologyLoss(nn.Module):
         # 2. Estrai coordinate differenziabili
         coords = soft_argmax(pred_heatmaps, beta=self.beta)  # [B, K, 2]
 
-        # 3. Termini STL
-        L_bone  = bone_ratio_loss(coords)
-        L_angle = joint_angle_loss(coords)
-        L_order = geometric_ordering_loss(coords)
+        # 3. Maschera di validita': [B, K]
+        #    La STL opera SOLO sui keypoint annotati. Senza maschera,
+        #    i keypoint con target_weight=0 hanno heatmap rumore ->
+        #    coordinate casuali -> rapporti/angoli assurdi -> loss esplode.
+        valid_mask = target_weight.squeeze(-1)  # [B, K]
+
+        # 4. Termini STL (mascherati)
+        L_bone  = bone_ratio_loss(coords, valid_mask)
+        L_angle = joint_angle_loss(coords, valid_mask)
+        L_order = geometric_ordering_loss(coords, valid_mask)
 
         # 4. Combinazione pesata
         L_total = (L_hm
