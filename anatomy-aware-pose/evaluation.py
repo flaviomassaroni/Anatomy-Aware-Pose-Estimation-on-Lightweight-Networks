@@ -9,8 +9,7 @@ from tqdm.auto import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from config import (NUM_KEYPOINTS, INPUT_SIZE, HEATMAP_SIZE,
-                    COCO_VAL_IMG, COCO_VAL_ANN, OCHUMAN_IMG, OCHUMAN_VAL_ANN)
+from config import (NUM_KEYPOINTS, INPUT_SIZE, HEATMAP_SIZE, COCO_VAL_IMG, COCO_VAL_ANN, OCHUMAN_IMG, OCHUMAN_VAL_ANN, BONE_RATIO_THRESHOLD, COLLAPSE_THRESHOLD, MIN_CONF, AVR_ANGLE_MIN_DEG)
 from utils import decode_heatmaps, heatmap_to_original
 from data import build_samples, COCOEvalDataset
 
@@ -87,14 +86,12 @@ SYMMETRIC_BONE_PAIRS = [
 ]
 # (estremo1, giunto, estremo2, angolo minimo plausibile in gradi)
 ANGLE_JOINTS = [
-    ('left_hip', 'left_knee', 'left_ankle', 20.0),
-    ('right_hip', 'right_knee', 'right_ankle', 20.0),
-    ('left_shoulder', 'left_elbow', 'left_wrist', 20.0),
-    ('right_shoulder', 'right_elbow', 'right_wrist', 20.0),
+    ('left_hip', 'left_knee', 'left_ankle', AVR_ANGLE_MIN_DEG),
+    ('right_hip', 'right_knee', 'right_ankle', AVR_ANGLE_MIN_DEG),
+    ('left_shoulder', 'left_elbow', 'left_wrist', AVR_ANGLE_MIN_DEG),
+    ('right_shoulder', 'right_elbow', 'right_wrist', AVR_ANGLE_MIN_DEG),
 ]
-BONE_RATIO_THRESHOLD = 1.5
-MIN_CONF = 0.3
-COLLAPSE_THRESHOLD = 0.10
+
 
 
 def _dist(p1, p2):

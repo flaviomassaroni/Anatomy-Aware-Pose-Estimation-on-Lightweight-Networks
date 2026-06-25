@@ -1,9 +1,10 @@
 """Skeletal Topology Loss (STL) — loss differenziabile con prior anatomici.
 
-Tre termini:
+Quattro termini:
   1. Bone ratio   — rapporti di lunghezza ossea fuori range antropometrico
   2. Joint angle  — angoli articolari fuori range fisiologico
   3. Geometric ordering — giunti fuori ordine lungo le catene cinematiche
+  4. Bone collapse — segmenti collassati (giunto sovrapposto a un estremo)
 
 Tutti i termini operano su COORDINATE, non su heatmap. Il ponte e' la
 soft-argmax, che estrae coordinate differenziabili dalle heatmap.
@@ -11,15 +12,13 @@ soft-argmax, che estrae coordinate differenziabili dalle heatmap.
 Fonti: Winter 2009, Drillis & Contini 1966, AAOS 1965.
 Vedi anthropometric_constraints.py per i range e le citazioni.
 """
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from anthropometric_constraints import (
-    BONE_RATIOS, SYMMETRY_PAIRS, SYMMETRY_RANGE,
-    JOINT_ANGLE_RANGES, KINEMATIC_CHAINS,
+from config import BONE_RATIO_THRESHOLD, COLLAPSE_THRESHOLD
+from anthropometric_constraints import (BONE_RATIOS, SYMMETRY_PAIRS,JOINT_ANGLE_RANGES, KINEMATIC_CHAINS,
 )
 
 
@@ -163,10 +162,12 @@ def _joint_angle(coords, kp_a, kp_joint, kp_b):
 #   a) Rapporti inter-segmentali (avambraccio/braccio, gamba/coscia, ...)
 #      -> penalita' se il rapporto esce dal range [r_min, r_max]
 #   b) Simmetria sx/dx (braccio sx vs dx, coscia sx vs dx, ...)
-#      -> penalita' se il rapporto sx/dx esce dal range [0.65, 1.55]
+#      -> hinge su |log(ratio)| con soglia log(BONE_RATIO_THRESHOLD).
+#         Fires se max(len_sx,len_dx)/min(...) > 1.5: coincide esattamente
+#         con la categoria bone_ratio dell'AVR. Spazio log: ratio=2.0 e
+#         ratio=0.5 ricevono la stessa penalita' (simmetria fisica).
 #
-# Penalita': hinge loss al quadrato (smooth, zero dentro il range):
-#   penalty = max(0, r_min - ratio)^2 + max(0, ratio - r_max)^2
+# Penalita' b): relu(|log(ratio)| - log(1.5))^2
 
 def _kp_valid(valid_mask, *kp_indices):
     """Ritorna [B] mask: 1.0 se TUTTI i keypoint indicati sono validi, 0.0 altrimenti."""
@@ -228,20 +229,20 @@ def bone_ratio_loss(coords, valid_mask):
             z = (log_ratio - log_nom) / BONE_SCALE
             losses.append(_masked_mean(_logcosh(z), mask))
 
-    # --- b) Simmetria sx/dx: hinge quadratica con clamp (4 regole) ---
-    SYMMETRY_CAP = 4.0  # oltre il cap la posa e' irrecuperabile, satura
-    s_min, s_max = SYMMETRY_RANGE
+    # --- b) Simmetria sx/dx: hinge su |log(ratio)| in spazio log (4 regole) ---
+    # log(BONE_RATIO_THRESHOLD) = soglia: fires se max/min > 1.5, esattamente come l'AVR.
+    # Spazio log rende simmetrica la penalita' (ratio=2.0 e ratio=0.5 penalizzati uguale).
+    LOG_SYM_THRESHOLD = math.log(BONE_RATIO_THRESHOLD)
+    SYMMETRY_CAP = 4.0
     for (left_a, left_b), (right_a, right_b), _ in SYMMETRY_PAIRS:
         mask = _kp_valid(valid_mask, left_a, left_b, right_a, right_b)
-
-        len_left = _bone_length(coords, left_a, left_b)
+        len_left  = _bone_length(coords, left_a,  left_b)
         len_right = _bone_length(coords, right_a, right_b)
-        ratio = len_left / (len_right + 1e-6)  # [B]
-
-        below = F.relu(s_min - ratio)
-        above = F.relu(ratio - s_max)
-        penalty = torch.clamp(below ** 2 + above ** 2, max=SYMMETRY_CAP)
-        losses.append(_masked_mean(penalty, mask))
+        ratio = len_left / (len_right + 1e-6)
+        log_ratio = torch.log(ratio + 1e-6)
+        penalty = torch.clamp(F.relu(log_ratio.abs() - LOG_SYM_THRESHOLD) ** 2,
+                              max=SYMMETRY_CAP)
+        losses.append(_masked_mean(penalty, mask))      
 
     if not losses:
         return torch.tensor(0.0, device=coords.device)
@@ -303,6 +304,43 @@ def joint_angle_loss(coords, valid_mask):
 #
 # Penalita': max(0, -t)^2 + max(0, t - 1)^2
 
+def collapse_loss(coords, valid_mask):
+    """Penalizza segmenti collassati: seg/torso < COLLAPSE_THRESHOLD.
+    
+    Replica esatta della categoria 'collapse' dell'AVR (evaluation.py):
+    stessi 4 giunti (gomiti + ginocchia), stessa scala torso, stessa soglia.
+    
+    coords:     [B, K, 2]
+    valid_mask: [B, K]
+    """
+    SHOULDER_L, SHOULDER_R, HIP_L, HIP_R = 5, 6, 11, 12
+    # Stessi 4 giunti dell'AVR
+    COLLAPSE_JOINTS = [
+        (5, 7, 9),    # spalla sx -> gomito sx -> polso sx
+        (6, 8, 10),   # spalla dx -> gomito dx -> polso dx
+        (11, 13, 15), # anca sx -> ginocchio sx -> caviglia sx
+        (12, 14, 16), # anca dx -> ginocchio dx -> caviglia dx
+    ]
+    torso_kp_mask = _kp_valid(valid_mask, SHOULDER_L, SHOULDER_R, HIP_L, HIP_R)
+
+    shoulder_mid = (coords[:, SHOULDER_L, :] + coords[:, SHOULDER_R, :]) / 2
+    hip_mid      = (coords[:, HIP_L, :]      + coords[:, HIP_R, :])      / 2
+    torso = torch.sqrt(((shoulder_mid - hip_mid) ** 2).sum(dim=-1) + 1e-6)  # [B]
+
+    losses = []
+    for kp_a, kp_joint, kp_b in COLLAPSE_JOINTS:
+        mask = torso_kp_mask * _kp_valid(valid_mask, kp_a, kp_joint, kp_b)
+        d1 = _bone_length(coords, kp_a,    kp_joint) / (torso + 1e-6)
+        d2 = _bone_length(coords, kp_joint, kp_b)    / (torso + 1e-6)
+        penalty = (F.relu(COLLAPSE_THRESHOLD - d1) ** 2
+                 + F.relu(COLLAPSE_THRESHOLD - d2) ** 2)
+        losses.append(_masked_mean(penalty, mask))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=coords.device)
+
+# geometric_ordering_loss: prior soft sul kinematic tree (inductive bias).
+# NON e' una categoria del KPI AVR; lambda_order calibrato separatamente.
+
 def geometric_ordering_loss(coords, valid_mask):
     """Penalizza giunti fuori ordine lungo le catene cinematiche.
 
@@ -338,9 +376,10 @@ def geometric_ordering_loss(coords, valid_mask):
 # ===================================================================
 
 class SkeletalTopologyLoss(nn.Module):
-    """Loss combinata: L_heatmap + lambda_bone * L_bone
-                                 + lambda_angle * L_angle
-                                 + lambda_order * L_order
+    """Loss combinata: L_heatmap + lambda_bone    * L_bone
+                                 + lambda_angle   * L_angle
+                                 + lambda_order   * L_order
+                                 + lambda_collapse * L_collapse
 
     I lambda controllano il peso di ogni termine. Valori di partenza
     suggeriti per il grid search: lambda ~ 0.1 - 1.0 ciascuno.
@@ -350,12 +389,13 @@ class SkeletalTopologyLoss(nn.Module):
 
     def __init__(self, heatmap_criterion,
                  lambda_bone=0.5, lambda_angle=0.5, lambda_order=0.5,
-                 beta=10.0):
+                 lambda_collapse=0.5, beta=10.0):
         super().__init__()
         self.heatmap_criterion = heatmap_criterion
         self.lambda_bone = lambda_bone
         self.lambda_angle = lambda_angle
         self.lambda_order = lambda_order
+        self.lambda_collapse = lambda_collapse
         self.beta = beta
 
     def forward(self, pred_heatmaps, target_heatmaps, target_weight):
@@ -378,23 +418,37 @@ class SkeletalTopologyLoss(nn.Module):
         #    coordinate casuali -> rapporti/angoli assurdi -> loss esplode.
         valid_mask = target_weight.squeeze(-1)  # [B, K]
 
-        # 4. Termini STL (mascherati)
-        L_bone  = bone_ratio_loss(coords, valid_mask)
-        L_angle = joint_angle_loss(coords, valid_mask)
-        L_order = geometric_ordering_loss(coords, valid_mask)
+        # LIMITATION / SCELTA DELIBERATA — gate disallineato con l'AVR:
+        #   STL usa target_weight (GT annotazioni): maschera keypoint non annotati,
+        #   evita che coordinate-spazzatura su kp mancanti esplodano i termini.
+        #   AVR usa score >= MIN_CONF (confidenza predetta): misura la coerenza interna
+        #   della predizione senza GT. Allineare i gate e' possibile ma non ovvio:
+        #   lo score a eval e' il picco della heatmap (valore assoluto, non calibrato),
+        #   che fluttua durante il training -> gating instabile. Il masking via
+        #   target_weight e' una scelta deliberata di stabilita', non una limitazione
+        #   tecnica insuperabile.
 
-        # 4. Combinazione pesata
+
+        # 4. Termini STL (mascherati)
+        L_bone     = bone_ratio_loss(coords, valid_mask)
+        L_angle    = joint_angle_loss(coords, valid_mask)
+        L_order    = geometric_ordering_loss(coords, valid_mask)
+        L_collapse = collapse_loss(coords, valid_mask)
+
+        # 5. Combinazione pesata
         L_total = (L_hm
-                   + self.lambda_bone * L_bone
-                   + self.lambda_angle * L_angle
-                   + self.lambda_order * L_order)
+                   + self.lambda_bone    * L_bone
+                   + self.lambda_angle   * L_angle
+                   + self.lambda_order   * L_order
+                   + self.lambda_collapse * L_collapse)
 
         # Dict per logging (utile per monitorare quale termine domina)
         terms = {
-            'heatmap': L_hm.item(),
-            'bone':    L_bone.item(),
-            'angle':   L_angle.item(),
-            'order':   L_order.item(),
-            'total':   L_total.item(),
+            'heatmap':  L_hm.item(),
+            'bone':     L_bone.item(),
+            'angle':    L_angle.item(),
+            'order':    L_order.item(),
+            'collapse': L_collapse.item(),
+            'total':    L_total.item(),
         }
         return L_total, terms

@@ -8,7 +8,7 @@ correttamente differenziabile e non puo' essere usato in training.
 import torch
 from torch.autograd import gradcheck
 from stl import (soft_argmax, bone_ratio_loss, joint_angle_loss,
-                 geometric_ordering_loss, SkeletalTopologyLoss)
+                 geometric_ordering_loss, collapse_loss, SkeletalTopologyLoss)
 from train import WeightedMSELoss
 
 
@@ -80,7 +80,8 @@ def test_bone_ratio():
             coords.data[b, 15] = torch.tensor([22.0, 79.1])   # left_ankle
             coords.data[b, 16] = torch.tensor([28.0, 79.1])   # right_ankle
 
-    loss_good = bone_ratio_loss(coords)
+    valid_mask = torch.ones(B, K, dtype=torch.float64)
+    loss_good = bone_ratio_loss(coords, valid_mask)
     print(f"  Loss su posa corretta: {loss_good.item():.6f} (atteso: ~0)")
 
     # Posa rotta: braccio sinistro 3x piu' lungo del destro
@@ -88,13 +89,14 @@ def test_bone_ratio():
     with torch.no_grad():
         coords_bad.data[:, 9] = torch.tensor([10.0, 80.0])  # polso sx lontanissimo
 
-    loss_bad = bone_ratio_loss(coords_bad)
+    loss_bad = bone_ratio_loss(coords_bad, valid_mask)
     print(f"  Loss su posa rotta:   {loss_bad.item():.6f} (atteso: >> 0)")
     assert loss_bad > loss_good, "La posa rotta dovrebbe avere loss piu' alta!"
 
-    # Gradcheck
+    # Gradcheck (valid_gc senza requires_grad: gradcheck testa solo coords_gc)
     coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10
-    ok = gradcheck(bone_ratio_loss, (coords_gc,), eps=1e-4, atol=1e-3)
+    valid_gc = torch.ones(1, 17, dtype=torch.float64)
+    ok = gradcheck(bone_ratio_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
     print(f"  Gradcheck bone_ratio_loss: {'OK' if ok else 'FALLITO'}")
     return ok
 
@@ -105,12 +107,13 @@ def test_joint_angle():
 
     B, K = 1, 17
     coords = torch.zeros(B, K, 2, dtype=torch.float64, requires_grad=True)
+    valid_mask = torch.ones(B, K, dtype=torch.float64)
 
-    # Gomito a ~90 gradi (dentro il range [10, 180])
+    # Gomito a ~90 gradi (dentro il range [20, 180])
     with torch.no_grad():
-        coords.data[0, 5]  = torch.tensor([0.0, 0.0])   # shoulder
+        coords.data[0, 5]  = torch.tensor([0.0, 0.0])    # shoulder
         coords.data[0, 7]  = torch.tensor([10.0, 0.0])   # elbow
-        coords.data[0, 9]  = torch.tensor([10.0, 10.0])  # wrist -> angolo 90°
+        coords.data[0, 9]  = torch.tensor([10.0, 10.0])  # wrist -> angolo 90deg
         # Riempi anche il lato destro e le gambe per avere tutte le regole
         coords.data[0, 6]  = torch.tensor([0.0, 0.0])
         coords.data[0, 8]  = torch.tensor([-10.0, 0.0])
@@ -122,7 +125,7 @@ def test_joint_angle():
         coords.data[0, 15] = torch.tensor([5.0, 45.0])
         coords.data[0, 16] = torch.tensor([-5.0, 45.0])
 
-    loss_normal = joint_angle_loss(coords)
+    loss_normal = joint_angle_loss(coords, valid_mask)
     print(f"  Loss su angoli normali: {loss_normal.item():.6f} (atteso: ~0)")
 
     # Gomito collassato: 3 punti quasi sovrapposti -> angolo ~0
@@ -132,13 +135,14 @@ def test_joint_angle():
         coords_bad.data[0, 7] = torch.tensor([10.0, 0.0])   # elbow
         coords_bad.data[0, 9] = torch.tensor([10.1, 0.0])   # wrist appena spostato
 
-    loss_bad = joint_angle_loss(coords_bad)
+    loss_bad = joint_angle_loss(coords_bad, valid_mask)
     print(f"  Loss su gomito collassato: {loss_bad.item():.6f} (atteso: >> 0)")
     assert loss_bad > loss_normal
 
     # Gradcheck
     coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10 + 5
-    ok = gradcheck(joint_angle_loss, (coords_gc,), eps=1e-4, atol=1e-3)
+    valid_gc = torch.ones(1, 17, dtype=torch.float64)
+    ok = gradcheck(joint_angle_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
     print(f"  Gradcheck joint_angle_loss: {'OK' if ok else 'FALLITO'}")
     return ok
 
@@ -149,6 +153,7 @@ def test_geometric_ordering():
 
     B, K = 1, 17
     coords = torch.zeros(B, K, 2, dtype=torch.float64, requires_grad=True)
+    valid_mask = torch.ones(B, K, dtype=torch.float64)
 
     # Catena corretta: spalla(5) -> gomito(7) -> polso(9) in ordine
     with torch.no_grad():
@@ -165,7 +170,7 @@ def test_geometric_ordering():
         coords.data[0, 14] = torch.tensor([15.0, 30.0])
         coords.data[0, 16] = torch.tensor([15.0, 40.0])
 
-    loss_ok = geometric_ordering_loss(coords)
+    loss_ok = geometric_ordering_loss(coords, valid_mask)
     print(f"  Loss catene ordinate: {loss_ok.item():.6f} (atteso: ~0)")
 
     # Ginocchio DOPO la caviglia -> violazione
@@ -173,14 +178,58 @@ def test_geometric_ordering():
     with torch.no_grad():
         coords_bad.data[0, 13] = torch.tensor([5.0, 50.0])  # ginocchio sotto caviglia!
 
-    loss_bad = geometric_ordering_loss(coords_bad)
+    loss_bad = geometric_ordering_loss(coords_bad, valid_mask)
     print(f"  Loss catena rotta:    {loss_bad.item():.6f} (atteso: >> 0)")
     assert loss_bad > loss_ok
 
     # Gradcheck
     coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10
-    ok = gradcheck(geometric_ordering_loss, (coords_gc,), eps=1e-4, atol=1e-3)
+    valid_gc = torch.ones(1, 17, dtype=torch.float64)
+    ok = gradcheck(geometric_ordering_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
     print(f"  Gradcheck geometric_ordering_loss: {'OK' if ok else 'FALLITO'}")
+    return ok
+
+
+def test_collapse():
+    """Verifica collapse_loss: posa normale -> ~0; ginocchio collassato -> >>0."""
+    print("\n=== Test collapse loss ===")
+
+    B, K = 1, 17
+    coords = torch.zeros(B, K, 2, dtype=torch.float64, requires_grad=True)
+    valid_mask = torch.ones(B, K, dtype=torch.float64)
+
+    # Scheletro: torso_scale = 50 px, segmenti ~20 px (40% del torso >> soglia 10%)
+    with torch.no_grad():
+        coords.data[0, 5]  = torch.tensor([20.0,  0.0])   # left_shoulder
+        coords.data[0, 6]  = torch.tensor([30.0,  0.0])   # right_shoulder
+        coords.data[0, 11] = torch.tensor([20.0, 50.0])   # left_hip
+        coords.data[0, 12] = torch.tensor([30.0, 50.0])   # right_hip
+        coords.data[0, 7]  = torch.tensor([20.0, 20.0])   # left_elbow  (dist=20 da spalla)
+        coords.data[0, 9]  = torch.tensor([20.0, 40.0])   # left_wrist  (dist=20 da gomito)
+        coords.data[0, 8]  = torch.tensor([30.0, 20.0])   # right_elbow
+        coords.data[0, 10] = torch.tensor([30.0, 40.0])   # right_wrist
+        coords.data[0, 13] = torch.tensor([20.0, 70.0])   # left_knee   (dist=20 da anca)
+        coords.data[0, 15] = torch.tensor([20.0, 90.0])   # left_ankle  (dist=20 da ginocchio)
+        coords.data[0, 14] = torch.tensor([30.0, 70.0])   # right_knee
+        coords.data[0, 16] = torch.tensor([30.0, 90.0])   # right_ankle
+
+    loss_ok = collapse_loss(coords, valid_mask)
+    print(f"  Loss posa normale:         {loss_ok.item():.6f} (atteso: ~0)")
+
+    # Ginocchio sx collassato: dist(anca, ginocchio) = 1 px / torso 50 px = 0.02 < 0.10
+    coords_bad = coords.detach().clone().requires_grad_(True)
+    with torch.no_grad():
+        coords_bad.data[0, 13] = torch.tensor([20.0, 51.0])
+
+    loss_bad = collapse_loss(coords_bad, valid_mask)
+    print(f"  Loss ginocchio collassato: {loss_bad.item():.6f} (atteso: >> 0)")
+    assert loss_bad > loss_ok, "Il ginocchio collassato dovrebbe avere loss piu' alta!"
+
+    # Gradcheck (valid_gc senza requires_grad: gradcheck testa solo coords_gc)
+    coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10 + 5
+    valid_gc = torch.ones(1, 17, dtype=torch.float64)
+    ok = gradcheck(collapse_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
+    print(f"  Gradcheck collapse_loss: {'OK' if ok else 'FALLITO'}")
     return ok
 
 
@@ -195,15 +244,17 @@ def test_combined():
 
     criterion = SkeletalTopologyLoss(
         heatmap_criterion=WeightedMSELoss(),
-        lambda_bone=0.5, lambda_angle=0.5, lambda_order=0.5, beta=10.0,
+        lambda_bone=0.5, lambda_angle=0.5, lambda_order=0.5,
+        lambda_collapse=0.5, beta=10.0,
     )
 
     loss, terms = criterion(pred, target, weight)
     print(f"  Loss totale: {terms['total']:.4f}")
-    print(f"    heatmap: {terms['heatmap']:.4f}")
-    print(f"    bone:    {terms['bone']:.4f}")
-    print(f"    angle:   {terms['angle']:.4f}")
-    print(f"    order:   {terms['order']:.4f}")
+    print(f"    heatmap:  {terms['heatmap']:.4f}")
+    print(f"    bone:     {terms['bone']:.4f}")
+    print(f"    angle:    {terms['angle']:.4f}")
+    print(f"    order:    {terms['order']:.4f}")
+    print(f"    collapse: {terms['collapse']:.4f}")
 
     # Verifica che il backward funzioni senza errori
     loss.backward()
@@ -220,6 +271,7 @@ if __name__ == '__main__':
     results.append(('bone_ratio_loss',     test_bone_ratio()))
     results.append(('joint_angle_loss',    test_joint_angle()))
     results.append(('geometric_ordering',  test_geometric_ordering()))
+    results.append(('collapse_loss',       test_collapse()))
     results.append(('combined_e2e',        test_combined()))
 
     print("\n" + "=" * 50)

@@ -18,6 +18,8 @@ Note importanti:
     (foreshortening). I range devono tenerne conto: usiamo margini
     conservativi, non range stretti.
 """
+from config import AVR_ANGLE_MIN_DEG
+
 
 # ===================================================================
 # COCO KEYPOINT INDICES (per riferimento)
@@ -94,7 +96,6 @@ SYMMETRY_PAIRS = [
     ((11, 13), (12, 14), 'thigh'),          # anca→ginocchio
     ((13, 15), (14, 16), 'shank'),          # ginocchio→caviglia
 ]
-SYMMETRY_RANGE = (0.65, 1.55)
 
 
 # ===================================================================
@@ -124,36 +125,25 @@ JOINT_ANGLE_RANGES = {
     # (kp_prossimale, kp_giunto, kp_distale): (angolo_min_deg, angolo_max_deg)
 
     # Gomito sinistro: spalla → gomito → polso
-    'left_elbow':  {'joints': (5, 7, 9),   'range_deg': (10.0, 180.0)},
+    'left_elbow':  {'joints': (5, 7, 9),   'range_deg': (AVR_ANGLE_MIN_DEG, 180.0)},
 
     # Gomito destro
-    'right_elbow': {'joints': (6, 8, 10),  'range_deg': (10.0, 180.0)},
+    'right_elbow': {'joints': (6, 8, 10),  'range_deg': (AVR_ANGLE_MIN_DEG, 180.0)},
 
     # Ginocchio sinistro: anca → ginocchio → caviglia
-    'left_knee':   {'joints': (11, 13, 15), 'range_deg': (10.0, 180.0)},
+    'left_knee':   {'joints': (11, 13, 15), 'range_deg': (AVR_ANGLE_MIN_DEG, 180.0)},
 
     # Ginocchio destro
-    'right_knee':  {'joints': (12, 14, 16), 'range_deg': (10.0, 180.0)},
-
-    # Spalla sinistra: anca_sx → spalla_sx → gomito_sx
-    # La spalla ha ROM molto ampio; vincoli piu' laschi
-    'left_shoulder':  {'joints': (11, 5, 7),  'range_deg': (10.0, 180.0)},
-
-    # Spalla destra
-    'right_shoulder': {'joints': (12, 6, 8),  'range_deg': (10.0, 180.0)},
-
-    # Anca sinistra: spalla_sx → anca_sx → ginocchio_sx
-    'left_hip':    {'joints': (5, 11, 13), 'range_deg': (15.0, 180.0)},
-
-    # Anca destra
-    'right_hip':   {'joints': (6, 12, 14), 'range_deg': (15.0, 180.0)},
+    'right_knee':  {'joints': (12, 14, 16), 'range_deg': (AVR_ANGLE_MIN_DEG, 180.0)},
 }
 
-# Nota per il paper: i range sono volutamente generosi (10° minimo
-# invece dei 30-40° clinici) per assorbire il foreshortening 2D.
-# Il punto NON e' replicare i range clinici esatti, ma escludere le
-# predizioni palesemente impossibili (angolo ~0° = collasso, angolo
-# >180° = giunto invertito).
+# Nota per il paper: mantenuti solo i 4 giunti dell'AVR (gomiti + ginocchia)
+# per allineare il segnale di training al KPI che vogliamo abbassare.
+# Spalla e anca sono stati rimossi: il loro ROM e' molto ampio (quasi 180°)
+# e il segnale di penalita' era quasi sempre zero, quindi non contribuivano.
+# Il floor e' AVR_ANGLE_MIN_DEG (20°) invece dei 30-40° clinici per assorbire
+# il foreshortening 2D. L'upper bound 180° resta inerte con atan2 (angolo in
+# [0, pi]), ma e' mantenuto per documentazione e simmetria con l'AVR.
 
 
 # ===================================================================
@@ -197,13 +187,13 @@ KINEMATIC_CHAINS = [
 # Bone symmetry       | Anatomia generale   |   4    | Asimmetria sx/dx
 #   (left vs right)   |                     |        | implausibile
 # ────────────────────┼─────────────────────┼────────┼──────────────────
-# Joint angle         | AAOS 1965,          |   8    | Giunti collassati
-#                     | Winter 2009 Ch.2    |        | o invertiti
+# Joint angle         | AAOS 1965,          |   4    | Giunti collassati
+#   (gomiti+ginocchia)| Winter 2009 Ch.2    |        | o invertiti
 # ────────────────────┼─────────────────────┼────────┼──────────────────
 # Geometric ordering  | Kinematic tree      |   4    | Giunto fuori
 #                     |                     |        | dalla catena
 # ────────────────────┼─────────────────────┼────────┼──────────────────
-# TOTALE              |                     |  19    |
+# TOTALE              |                     |  15    |
 #
 # Differenza chiave da Han et al. (2025):
 #   Han → apprende medie e deviazioni standard DAL DATASET (vincoli

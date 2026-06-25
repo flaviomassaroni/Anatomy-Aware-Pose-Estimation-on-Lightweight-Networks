@@ -39,3 +39,13 @@ OCHUMAN_TEST_ANN = '/kaggle/input/datasets/messinaalberto/ochuman/ochuman_coco_f
 
 # --- Output (resta su Kaggle, NON su Git) ---
 CHECKPOINT_DIR = '/kaggle/working/checkpoints'
+
+# --- STL fine-tuning (valori wirrati nelle celle 3c e 4b del notebook) ---
+BONE_RATIO_THRESHOLD = 1.5    # soglia max/min per simmetria ossea (AVR + STL)
+COLLAPSE_THRESHOLD   = 0.10   # segmento/torso minimo (AVR + STL)
+MIN_CONF             = 0.3    # confidenza minima per l'AVR (score heatmap)
+AVR_ANGLE_MIN_DEG    = 20.0   # floor angolare condiviso AVR e STL
+STL_FINE_TUNE_LR     = 3e-5   # era 1e-4: ridotto per evitare catastrophic forgetting da E04
+STL_TARGET_FRAC      = 0.1    # era 1.0: STL pesava 3:1 su heatmap (causa gaming)
+STL_NUM_EPOCHS       = 10
+STL_BETA             = 30     # soft_argmax piu' nitida, riduce gap train/eval
