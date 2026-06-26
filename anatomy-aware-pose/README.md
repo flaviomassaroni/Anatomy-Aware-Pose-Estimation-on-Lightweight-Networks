@@ -57,13 +57,14 @@ these devices.
 We propose a three-part contribution:
 
 ### 2.1 Skeletal Topology Loss (STL)
-A differentiable, plug-in loss function with three terms:
+A differentiable, plug-in loss function with four terms:
 
 | Term | What it penalizes | Example |
 |------|-------------------|---------|
-| **Bone ratio** | Limb-length ratios outside anthropometric ranges | Forearm/upper-arm ratio outside [0.71, 0.85] |
-| **Joint angle** | Joint angles outside physiological ranges | Elbow angle < 5° or > 175° |
+| **Bone ratio** | Limb-length ratios outside anthropometric ranges | Forearm/upper-arm ratio deviating from Winter 2009 nominal |
+| **Joint angle** | Joint angles outside physiological ranges | Elbow or knee angle < 20° |
 | **Geometric ordering** | Joints out of order along kinematic chains | Knee not between hip and ankle |
+| **Bone collapse** | Segments shorter than 10% of torso length | Elbow collapsed onto shoulder |
 
 The constraints are **absolute and anthropometric** (from biomechanical
 literature), NOT statistical values learned from the dataset. This is the key
@@ -95,14 +96,14 @@ The code follows the structure required by the professor:
 **Imports → Globals → Utils → Data → Network → Train → Evaluation**
 
 ```
-├── config.py                        # Globals: paths, hyperparameters, seed, device
+├── config.py                        # Globals: paths, hyperparameters, seed, device, STL/AVR thresholds
 ├── utils.py                         # Utils: heatmap generation/decoding, coordinate transforms
 ├── data.py                          # Data: COCO/OCHuman parsing, Dataset classes
 ├── network.py                       # Network: MobileNetV3 + DeconvHead
 ├── train.py                         # Train: WeightedMSELoss, training loop, checkpointing
 ├── evaluation.py                    # Evaluation: inference, AP/AR, AVR, COCO/OCHuman wrappers
 ├── anthropometric_constraints.py    # Anthropometric ranges from biomechanical literature
-├── stl.py                           # Skeletal Topology Loss (soft-argmax + 3 differentiable terms)
+├── stl.py                           # Skeletal Topology Loss (soft-argmax + 4 differentiable terms)
 ├── test_stl.py                      # Differentiability tests (gradcheck) for all STL components
 ├── kaggle_runner.ipynb              # Minimal notebook that clones the repo and runs everything
 ├── .gitignore
@@ -552,8 +553,8 @@ Key observations:
 ## 11. Skeletal Topology Loss (STL) — Implementation
 
 The STL is implemented in `stl.py` with anthropometric ranges in
-`anthropometric_constraints.py`. All terms pass `torch.autograd.gradcheck`
-(verified in `test_stl.py`).
+`anthropometric_constraints.py` and shared thresholds in `config.py`.
+All terms pass `torch.autograd.gradcheck` (verified in `test_stl.py`).
 
 ### 11.1 Soft-Argmax — the bridge between heatmaps and coordinates
 
@@ -575,35 +576,61 @@ x̂ = Σ_j  j · Σ_i p(i,j)            ← expected column
 
 ### 11.2 Term 1: Bone Ratio Loss
 
-Two sub-terms:
+Two sub-terms with **different penalty shapes**, each justified by physics:
 
 **(a) Inter-segment ratios** (3 rules × 2 sides = 6 checks). For each
 anatomical ratio (e.g. forearm/upper-arm), compute from predicted coordinates
-and penalize if outside the anthropometric range:
+and apply a **log-cosh penalty** centered on Winter's nominal in log space:
 
 ```
-ratio = ‖elbow - wrist‖ / ‖shoulder - elbow‖
-L = max(0, r_min - ratio)² + max(0, ratio - r_max)²
+ratio  = ‖elbow - wrist‖ / ‖shoulder - elbow‖
+z      = (log(ratio) - log(nominal)) / BONE_SCALE
+L      = log-cosh(z)   where log-cosh(x) ≈ x²/2 near 0, ≈ |x| for large x
 ```
 
-Ranges from Winter 2009 / Drillis & Contini 1966:
+**Why log-cosh instead of hinge?** Inter-segment ratios compare *different*
+bones. Monocular 2D projection means each bone can be foreshortened
+independently: a bone pointing toward the camera at 75° projects to
+cos(75°) ≈ 0.26 of its true length. A Winter ratio of 0.785 can legitimately
+appear anywhere from ~0.20 to ~3.0 in 2D. A hard hinge at [0.55, 1.05]
+produces loss ~37 on valid foreshortened poses and dominates the gradient with
+a few outliers. Log-cosh is robust: it tolerates projection variance, then
+grows smoothly beyond it.
 
-| Ratio | Nominal | Range |
-|-------|---------|-------|
-| Forearm / Upper arm | 0.785 | [0.55, 1.05] |
-| Shank / Thigh | 1.004 | [0.70, 1.35] |
-| Upper arm / Thigh | 0.759 | [0.50, 1.05] |
+**Why log space?** Makes the penalty symmetric: ratio=2.0 and ratio=0.5
+receive equal penalization (a ratio and its reciprocal are equally "wrong").
 
-Ranges are generous (nominal ± ~30%) to absorb individual variability and 2D
-foreshortening.
+**BONE_SCALE = 1.35** — the log-distance from a nominal to the boundary of
+geometrically expected foreshortening: `log(1/cos(75°)) = log(1/0.259) ≈ 1.35`.
+One geometric parameter, not tuned on the dataset.
 
-**(b) Left/right symmetry** (4 checks). Same bone on left vs right side:
-ratio must stay in [0.65, 1.55].
+Nominals from Winter 2009 / Drillis & Contini 1966:
+
+| Ratio | Nominal |
+|-------|---------|
+| Forearm / Upper arm | 0.785 |
+| Shank / Thigh | 1.004 |
+| Upper arm / Thigh | 0.759 |
+
+**(b) Left/right symmetry** (4 checks). Same bone on left vs right side,
+penalized via **hinge on |log(ratio)|** in log space:
+
+```
+L = relu(|log(left_len / right_len)| - log(1.5))²
+```
+
+**Why hinge (not log-cosh) here?** Symmetry compares the *same* bone on both
+sides. Foreshortening is approximately shared (the two limbs are roughly
+coplanar), so deviation from ratio=1 signals a prediction error, not
+projection geometry. The threshold `log(1.5)` fires exactly when
+`max/min > 1.5` — identical to the `bone_ratio` category of the AVR metric.
+Log space makes it symmetric: ratio=2.0 and ratio=0.5 are penalized equally.
 
 ### 11.3 Term 2: Joint Angle Loss
 
-8 joints checked (elbow, knee, shoulder, hip — left and right). The angle at
-each joint vertex is computed with **atan2**, not arccos:
+**4 joints checked** (left/right elbow, left/right knee — shoulders and hips
+removed because their ROM is nearly 180° and the penalty was almost always
+zero). The angle at each joint vertex is computed with **atan2**, not arccos:
 
 ```python
 cross = v1.x * v2.y - v1.y * v2.x    # 2D cross product (scalar)
@@ -615,10 +642,31 @@ angle = atan2(|cross|, dot)            # stable in [0, π]
 explodes at θ = 0 and θ = π — exactly the boundaries of our physiological
 range. atan2 has stable derivatives everywhere.
 
-Ranges from AAOS 1965 / Winter 2009, with generous minimums (10°–15°) to
-absorb 2D foreshortening.
+Floor is `AVR_ANGLE_MIN_DEG = 20°` (from `config.py`, shared with AVR metric).
+The upper bound 180° is inert with atan2 (angle ∈ [0, π]) but kept for
+documentation symmetry with the AVR. Floor is generous to absorb 2D
+foreshortening (clinical minimum is 30–40°).
 
-### 11.4 Term 3: Geometric Ordering Loss
+### 11.4 Term 3: Bone Collapse Loss
+
+4 kinematic chains (left/right arm, left/right leg). Each chain (proximal →
+joint → distal) is checked for collapse: each sub-segment must be at least
+`COLLAPSE_THRESHOLD` (10%) of the torso length.
+
+```
+torso  = ‖shoulder_mid - hip_mid‖
+d1     = ‖proximal - joint‖ / torso
+d2     = ‖joint - distal‖   / torso
+L      = relu(COLLAPSE_THRESHOLD - d1)² + relu(COLLAPSE_THRESHOLD - d2)²
+```
+
+This directly mirrors the `collapse` category of the AVR metric: same 4
+chains, same torso scale, same threshold (`COLLAPSE_THRESHOLD = 0.10` in
+`config.py`). A joint that collapses onto one of its neighbors — geometrically
+valid for angles but anatomically meaningless — is thus penalized during
+training with the same criterion used to measure it at evaluation.
+
+### 11.5 Term 4: Geometric Ordering Loss
 
 4 kinematic chains (left/right arm, left/right leg). For each chain
 (a → mid → b), the intermediate joint must project between the extremes:
@@ -631,27 +679,40 @@ L = max(0, −t)² + max(0, t − 1)²
 `t ∈ [0,1]` means mid is between a and b → zero penalty.
 `t < 0` or `t > 1` → mid is outside the chain → quadratic penalty.
 
-### 11.5 Combined Loss
+### 11.6 Combined Loss
 
 ```
-L_total = L_heatmap + λ_bone · L_bone + λ_angle · L_angle + λ_order · L_order
+L_total = L_heatmap + λ_bone     · L_bone
+                    + λ_angle    · L_angle
+                    + λ_order    · L_order
+                    + λ_collapse · L_collapse
 ```
 
 The `SkeletalTopologyLoss` class in `stl.py` wraps all terms and returns both
-the total loss and a per-term breakdown dict for logging.
+the total loss and a per-term breakdown dict for logging. All terms receive a
+`valid_mask` derived from `target_weight` to skip unannotated keypoints (their
+heatmaps are zero-target noise whose coordinates would corrupt the loss).
 
-### 11.6 Design Choices Summary
+STL fine-tuning hyperparameters are centralized in `config.py`:
+`STL_FINE_TUNE_LR`, `STL_TARGET_FRAC`, `STL_NUM_EPOCHS`, `STL_BETA`.
+AVR/STL shared thresholds: `BONE_RATIO_THRESHOLD`, `COLLAPSE_THRESHOLD`,
+`MIN_CONF`, `AVR_ANGLE_MIN_DEG`.
+
+### 11.7 Design Choices Summary
 
 | Choice | Why |
 |--------|-----|
-| Soft-argmax β=10 | Balances precision and gradient flow for σ=2 heatmaps |
+| Soft-argmax β=10 (training), β=30 (fine-tune) | β=10 balances precision/gradient for σ=2; β=30 sharpens coords at fine-tune stage, reduces train/eval gap |
 | atan2 not arccos | Stable gradients at range boundaries (0° and 180°) |
-| Hinge loss² | Zero inside range, smooth outside (no derivative discontinuity) |
-| √(x² + ε) | Prevents infinite gradient when bone length → 0 |
-| Ranges ± 30% | Absorbs individual variability + 2D foreshortening |
+| Log-cosh for inter-segment ratios | Robust to 2D foreshortening (outlier tolerance) while staying smooth at center |
+| Hinge² for symmetry + angles + ordering | Zero inside range, quadratic outside; physical: symmetric bones have correlated foreshortening |
+| Log space for ratio penalties | Symmetric: ratio=2.0 and ratio=0.5 penalized equally |
+| BONE_SCALE = 1.35 | Geometric: `log(1/cos(75°))` — tolerance boundary from expected monocular foreshortening |
+| valid_mask on all STL terms | Unannotated keypoints have garbage coordinates; masking prevents loss explosion |
+| Thresholds in config.py | STL and AVR share the same constants — a drop in one is guaranteed to reflect the other |
 | Absolute not statistical | Key differentiator from Han et al. (2025) |
 
-### 11.7 Differentiability Verification
+### 11.8 Differentiability Verification
 
 `test_stl.py` runs `torch.autograd.gradcheck` on every component:
 
@@ -661,6 +722,7 @@ $ python test_stl.py
 soft_argmax                    OK
 bone_ratio_loss                OK
 joint_angle_loss               OK
+collapse_loss                  OK
 geometric_ordering             OK
 combined_e2e                   OK
 
