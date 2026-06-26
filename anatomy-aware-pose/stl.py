@@ -451,4 +451,127 @@ class SkeletalTopologyLoss(nn.Module):
             'collapse': L_collapse.item(),
             'total':    L_total.item(),
         }
-        return L_total, terms
+        return L_total, terms# ===================================================================
+# CALIBRAZIONE DEI LAMBDA SU NORMA DEL GRADIENTE (GradNorm-style, statica)
+# ===================================================================
+#
+# PROBLEMA. Un lambda non controlla "quanto importa" un termine, ma quanto
+# forte il suo gradiente spinge i pesi a ogni passo. Termini diversi hanno
+# gradienti di scala diversa: l'angolo, gia' quasi sempre soddisfatto sulla
+# baseline, produce un gradiente minuscolo; bone/collapse molto piu' grande.
+# Pesare per il VALORE del termine (vecchia euristica 3c) premia il termine
+# gia' soddisfatto col lambda piu' alto -> training instabile.
+#
+# SOLUZIONE. Pesare per la NORMA DEL GRADIENTE. Per ogni termine misuriamo
+# g_t = || d L_t / d (final_layer) ||  (termine NON pesato), e idem per la
+# heatmap loss g_hm. Poi:
+#
+#     lambda_t = target_frac * g_hm / (g_t + eps)
+#
+# Cosi ogni vincolo imprime ai pesi una frazione 'target_frac' della spinta
+# della heatmap loss: influenza equalizzata, non valore.
+#
+# Misuriamo sul SOLO final_layer (Conv 1x1 che produce le 17 heatmap): e' il
+# collo di bottiglia condiviso dove tutti i gradienti vivono sugli stessi
+# pesi e sono confrontabili (come GradNorm, Chen et al. 2018). Misurare su
+# tutti i parametri sarebbe ~100x piu' lento senza cambiare il rapporto.
+
+def _grad_norm_on(params):
+    """Norma L2 del gradiente accumulato su una lista di parametri. 0 se assente."""
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            total += float(p.grad.detach().pow(2).sum().item())
+    return total ** 0.5
+
+
+@torch.no_grad()
+def _zero_grads(model):
+    for p in model.parameters():
+        p.grad = None
+
+
+def calibrate_lambdas(criterion, model, loader, device,
+                      target_frac=0.1, n_batches=4, eps=1e-9, verbose=True):
+    """Calibra i 4 lambda della STL sulla norma del gradiente (statico).
+
+    Args:
+        criterion: SkeletalTopologyLoss (i suoi lambda NON vengono usati qui;
+                   misuriamo i termini grezzi). Verra' AGGIORNATO in-place coi
+                   lambda calibrati prima di ritornare.
+        model:     il modello (in train mode); usiamo il suo .head.final_layer
+                   come parametro di riferimento per la norma.
+        loader:    DataLoader (tipicamente train_loader) per campionare i batch.
+        target_frac: rho. Frazione della spinta heatmap a cui portare ogni termine.
+        n_batches: su quanti batch mediare le norme (4 e' sufficiente e veloce).
+        eps:       stabilizzatore per termini con gradiente ~0.
+
+    Returns:
+        dict {'bone','angle','order','collapse'} coi lambda calibrati.
+        (Il criterion viene anche aggiornato in-place.)
+    """
+    # Parametri di riferimento: l'ultimo layer condiviso (Conv 1x1 -> 17 heatmap)
+    ref_params = list(model.head.final_layer.parameters())
+
+    # accumulatori delle norme medie
+    acc = {'heatmap': 0.0, 'bone': 0.0, 'angle': 0.0, 'order': 0.0, 'collapse': 0.0}
+    seen = 0
+
+    model.train()
+    it = iter(loader)
+    for _ in range(n_batches):
+        try:
+            imgs, hms, w = next(it)
+        except StopIteration:
+            break
+        imgs, hms, w = imgs.to(device), hms.to(device), w.to(device)
+
+        # forward UNA volta; ogni termine fa backward con retain_graph
+        out = model(imgs)
+        coords = soft_argmax(out, beta=criterion.beta)
+        valid_mask = w.squeeze(-1)
+
+        term_fns = {
+            'heatmap':  lambda: criterion.heatmap_criterion(out, hms, w),
+            'bone':     lambda: bone_ratio_loss(coords, valid_mask),
+            'angle':    lambda: joint_angle_loss(coords, valid_mask),
+            'order':    lambda: geometric_ordering_loss(coords, valid_mask),
+            'collapse': lambda: collapse_loss(coords, valid_mask),
+        }
+
+        # backward ISOLATO per ogni termine: azzera grad, backward del solo
+        # termine grezzo, leggi norma sul final_layer. retain_graph perche'
+        # tutti i termini condividono lo stesso grafo (out, coords).
+        keys = list(term_fns.keys())
+        for i, k in enumerate(keys):
+            _zero_grads(model)
+            L = term_fns[k]()
+            # l'ultimo backward puo' liberare il grafo
+            L.backward(retain_graph=(i < len(keys) - 1))
+            acc[k] += _grad_norm_on(ref_params)
+        seen += 1
+
+    _zero_grads(model)
+    for k in acc:
+        acc[k] /= max(seen, 1)
+
+    g_hm = acc['heatmap']
+    lambdas = {}
+    for k in ['bone', 'angle', 'order', 'collapse']:
+        lambdas[k] = target_frac * g_hm / (acc[k] + eps)
+
+    # aggiorna il criterion in-place
+    criterion.lambda_bone     = lambdas['bone']
+    criterion.lambda_angle    = lambdas['angle']
+    criterion.lambda_order    = lambdas['order']
+    criterion.lambda_collapse = lambdas['collapse']
+
+    if verbose:
+        print(f"Calibrazione lambda (gradient-norm, rho={target_frac}, "
+              f"{seen} batch, ref=final_layer):")
+        print(f"  norme grad grezze: " + "  ".join(
+            f"{k}={acc[k]:.3e}" for k in ['heatmap','bone','angle','order','collapse']))
+        print(f"  lambda calibrati : " + "  ".join(
+            f"{k}={lambdas[k]:.5f}" for k in ['bone','angle','order','collapse']))
+
+    return lambdas
