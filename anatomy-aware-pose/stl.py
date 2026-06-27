@@ -491,8 +491,19 @@ def _zero_grads(model):
         p.grad = None
 
 
+def _clamp_lambda_spread(lambdas, max_spread):
+    """Comprime lo spread dei lambda attorno alla media geometrica."""
+    keys = list(lambdas.keys())
+    log_vals = [math.log(lambdas[k] + 1e-12) for k in keys]
+    center = sum(log_vals) / len(log_vals)
+    max_dev = math.log(max_spread) / 2.0
+    return {k: math.exp(center + max(-max_dev, min(max_dev, lv - center)))
+            for k, lv in zip(keys, log_vals)}
+
+
 def calibrate_lambdas(criterion, model, loader, device,
-                      target_frac=0.1, n_batches=4, eps=1e-9, verbose=True):
+                      target_frac=0.1, n_batches=4, eps=1e-9,
+                      max_spread=20.0, verbose=True):
     """Calibra i 4 lambda della STL sulla norma del gradiente (statico).
 
     Args:
@@ -559,6 +570,9 @@ def calibrate_lambdas(criterion, model, loader, device,
     lambdas = {}
     for k in ['bone', 'angle', 'order', 'collapse']:
         lambdas[k] = target_frac * g_hm / (acc[k] + eps)
+
+    raw_lambdas = dict(lambdas)
+    lambdas = _clamp_lambda_spread(lambdas, max_spread)
 
     # aggiorna il criterion in-place
     criterion.lambda_bone     = lambdas['bone']
