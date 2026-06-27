@@ -521,8 +521,9 @@ anatomically meaningless.
 
 **Baseline behavior (measured):** the baseline (no STL) has AVR = 30.6% on
 COCO val and AVR = 48.2% on OCHuman — confirming that occlusion drives
-anatomical violations. After adding the STL, the AVR should drop
-significantly; this is the main result we are after.
+anatomical violations. The goal of the STL is to lower this AVR **without**
+destroying AP. Our first attempt at STL fine-tuning actually made both worse;
+the diagnosis and the fixes that followed are documented in Section 11.9.
 
 ---
 
@@ -569,10 +570,16 @@ x̂ = Σ_j  j · Σ_i p(i,j)            ← expected column
 ŷ = Σ_i  i · Σ_j p(i,j)            ← expected row
 ```
 
-**Temperature β = 10.** With our Gaussian heatmaps (σ=2, peak ≈ 1.0):
+**Temperature β.** With our Gaussian heatmaps (σ=2, peak ≈ 1.0):
 - β = 1: softmax too flat → coordinates collapse to center → useless
 - β = 100: softmax too sharp → near-delta → vanishing gradients
-- β = 10: precise coordinates (error < 0.2 px) AND healthy gradients
+- β ≈ 10: the original choice — precise (sub-pixel) coordinates with healthy gradients
+
+We initially set **β = 10**. A later empirical analysis of the train/eval
+decoder gap (Section 11.9) showed β = 10 produces a large mismatch between the
+soft-argmax coordinates the STL optimizes and the argmax coordinates the AVR
+measures — one of the causes of our first failed run. We therefore raised it to
+**β = 50** for fine-tuning. This is now centralized as `STL_BETA` in `config.py`.
 
 ### 11.2 Term 1: Bone Ratio Loss
 
@@ -702,7 +709,7 @@ AVR/STL shared thresholds: `BONE_RATIO_THRESHOLD`, `COLLAPSE_THRESHOLD`,
 
 | Choice | Why |
 |--------|-----|
-| Soft-argmax β=10 (training), β=30 (fine-tune) | β=10 balances precision/gradient for σ=2; β=30 sharpens coords at fine-tune stage, reduces train/eval gap |
+| Soft-argmax β=10 → β=50 | β=10 was the initial choice for σ=2 heatmaps; raised to β=50 after the decoder-gap analysis (Sec 11.9) showed β=10 mismatches the eval-time argmax decoder |
 | atan2 not arccos | Stable gradients at range boundaries (0° and 180°) |
 | Log-cosh for inter-segment ratios | Robust to 2D foreshortening (outlier tolerance) while staying smooth at center |
 | Hinge² for symmetry + angles + ordering | Zero inside range, quadratic outside; physical: symmetric bones have correlated foreshortening |
@@ -729,15 +736,151 @@ combined_e2e                   OK
 All tests passed. STL is differentiable and ready for training.
 ```
 
+### 11.9 First STL Run: Failure, Diagnosis, and Fixes
+
+We document this because the first STL fine-tuning run **failed**, and the
+diagnosis shaped the final design. Configuration: LR = 1e-4, value-based λ
+auto-calibration, β = 10, 10 epochs.
+
+**What happened.** Both objectives got worse. AP collapsed from 0.498 to 0.259.
+And — more damning — the *best* epoch already had AVR = 0.46, **worse** than the
+baseline's 0.306. A loss designed to reduce anatomical violations was producing
+more of them. That rules out a simple "lower the weights" fix: something was
+structurally wrong.
+
+| Epoch | AP | AVR rate |
+|-------|------|----------|
+| baseline | 0.498 | 0.306 |
+| E01 (best AP) | 0.484 | 0.464 |
+| E04 | 0.337 | 0.944 |
+| E10 | 0.259 | 0.824 |
+
+**Three root causes:**
+
+1. **Inverted λ auto-calibration.** The original heuristic set each weight as
+   `λ_k = TARGET_FRAC · L_hm / (raw value of term k)`. But a term's raw value is
+   *small precisely when the baseline already satisfies it*. The angle term sits
+   near zero on the baseline (angles already in range), so dividing by it
+   produced a huge `λ_angle ≈ 1.5`, ~300× the bone weight. The moment a few poses
+   left the angle range during training, they received an enormous gradient; the
+   model chased angles and abandoned the heatmaps. The heuristic rewarded the
+   already-satisfied term with the largest weight — the exact opposite of what we
+   want.
+
+2. **Learning rate 10× too high.** The intended fine-tuning LR was ~2e-5; the
+   code ran 1e-4. On already-converged weights this is textbook catastrophic
+   forgetting (the 1.5-point AP drop by E01, the cliff at E04).
+
+3. **Train/eval decoder mismatch.** The STL optimizes soft-argmax coordinates;
+   the AVR measures argmax + sub-pixel coordinates. They are two different
+   read-outs of the same heatmap. The STL can make *its* coordinates more
+   plausible while the *measured* coordinates degrade — one way a
+   violation-reducing loss raises the measured violation rate.
+
+The masking and the four terms were correct all along. The failure was in the
+training **harness** — weight calibration, learning rate, and an unverified
+assumption that two decoders agree.
+
+### 11.9.1 Decoder gap analysis → β = 50
+
+To quantify cause (3), we measured the per-keypoint Euclidean gap (in heatmap
+pixels) between `soft_argmax(β)` and `decode_heatmaps` (argmax + sub-pixel) on
+COCO val, on valid keypoints only:
+
+| β | median gap | p95 | max |
+|------|-----------|------|------|
+| 10 | 4.12 px | 21.1 | — |
+| 30 | 0.26 px | 9.3 | 32 |
+| 50 | 0.27 px | 3.2 | — |
+| 100 | 0.31 px | 0.79 | — |
+
+The median is reassuring at β ≥ 30, but the **heavy tail** (p95, max) is the
+real story: it comes from multimodal/flat heatmaps on occluded keypoints
+(wrists, hips, ankles) — exactly the joints the STL must act on. When a heatmap
+has two peaks, argmax picks one while soft-argmax averages to the middle, where
+no peak exists. Raising β tames the tail (p95: 9.3 → 0.79 from β=30 to β=100)
+without changing the median, but very high β flattens the gradient. We chose
+**β = 50** as the compromise (p95 = 3.2 px, gradients still usable) and document
+the sweep as an ablation. This also explains why the first run (β = 10) failed
+even setting the λ issue aside: a 4 px median gap means the STL was optimizing
+coordinates almost unrelated to those measured.
+
+### 11.10 λ Calibration: Gradient-Norm with Spread Clamp
+
+The replacement for the broken value-based heuristic. The insight: a λ does not
+control "how much we care" about a term — it controls **how strongly that term's
+gradient pushes the weights** at each step. Different terms have wildly different
+gradient scales, so equal λ does not mean equal influence.
+
+**Gradient-norm calibration (GradNorm-style, static; Chen et al. 2018).** For
+each unweighted term we measure the gradient norm w.r.t. the shared final layer
+(the 1×1 Conv producing the 17 heatmaps — the bottleneck where all gradients
+live on the same weights and are comparable), and set:
+
+```
+λ_t = ρ · g_hm / (g_t + ε)
+```
+
+so each constraint imprints a fraction ρ (`STL_TARGET_FRAC = 0.1`) of the
+heatmap loss's push. This is the **opposite** of the old bug: a term that
+already pushes hard (large g_t) gets a small λ; a quiet term gets a larger one —
+influence equalized, not value. Computed once on the baseline before
+fine-tuning (we keep `mode='per_epoch'` / full GradNorm for future work).
+Implemented in `stl.py::calibrate_lambdas`; gradient isolation per term is
+verified (zeroing grads between terms, no accumulation).
+
+**The instability problem and the spread clamp.** Run on the baseline, the raw
+calibration produces a pathological spread, and — crucially — an **unstable**
+one. Two independent runs of the calibration gave:
+
+| run | bone | angle | order | collapse | max/min spread |
+|-----|------|-------|-------|----------|----------------|
+| A | 8.9e-5 | 1.2e-3 | 3.9e-5 | 4.9e-2 | **1236×** |
+| B | 1.4e-4 | 3.3e-3 | 1.2e-5 | 1.9e-1 | **15573×** |
+
+The spread is enormous *and* jumps by an order of magnitude between identical
+runs. The reason: terms like `collapse` and `order` are already nearly satisfied
+by the baseline, so their gradient norm is dominated by a handful of violating
+poses that happen to fall in the 4 sampled batches. With so few samples, the
+norm of an almost-satisfied term is essentially noise — its value (and the
+resulting λ) is not reproducible. An un-clamped calibration would hand a
+near-satisfied term a 10⁴× weight, recreating exactly the failure mode that sank
+the first run.
+
+We therefore clamp the spread. After computing the raw λ, we compress them
+around their geometric mean so that `max/min ≤ max_spread` (default 20×), in log
+space for multiplicative symmetry:
+
+```python
+λ_t = exp( clamp( log(λ_t) − center, ±½·log(max_spread) ) + center )
+```
+
+With `max_spread = 20` the example above becomes
+`bone=1.5e-4, angle=1.2e-3, order=1.5e-4, collapse=3.0e-3` — no term dominates.
+Note `bone` and `order` end up equal: their raw difference (≈2×) is well within
+the sampling noise of a near-satisfied term measured on 4 batches, so the clamp
+correctly declines to distinguish quantities it has no reliable signal to
+separate. The instability across runs (1236× vs 15573×) is itself the
+experimental justification for the clamp: it is not cosmetic, it is what makes
+the calibration reproducible.
+
+This is also a free diagnosis for the paper: terms with near-zero baseline
+gradient norm (collapse) are constraints the baseline already respects; terms
+with large norm (order, bone) are where violations exist and the STL will act.
+
 ---
 
 ## 12. Still To Do
 
-### 12.1 STL Training + λ Tuning
+### 12.1 STL Training run
 
-Fine-tune from the baseline `best.pth` with `SkeletalTopologyLoss`. Start
-with λ_bone = λ_angle = λ_order = 0.5, then grid search on a validation
-subset. 10-15 epochs should suffice (backbone already converged).
+The harness is now fixed (Section 11.9–11.10): β = 50, LR = `STL_FINE_TUNE_LR`
+(3e-5), λ from gradient-norm calibration with spread clamp, selection on AP (not
+val_loss), all four terms including collapse. What remains is to **run** the
+fine-tuning from `best.pth` and read the result. Protocol: start with 1 epoch as
+a sanity check (AP must hold within ~1 point of 0.498, AVR must drop below
+0.306), then run the full schedule. Per-epoch checkpoints are saved so the
+AP/AVR trade-off can be inspected by hand.
 
 ### 12.2 Grad-CAM Explainability
 
@@ -747,13 +890,17 @@ model attend to neighboring visible joints?
 
 ### 12.3 Ablation Study
 
-Four configurations (required by project spec):
+Term ablation (the STL has **four** terms now):
 1. Heatmap loss only (baseline) — done
 2. Heatmap + bone ratio
 3. Heatmap + bone ratio + joint angle
-4. Full STL (all three terms)
+4. Heatmap + bone ratio + joint angle + collapse
+5. Full STL (+ geometric ordering)
 
-Plus λ sensitivity analysis (trade-off AP vs AVR).
+Already available as ablations from this work:
+- **β sweep** (decoder gap vs β, Section 11.9.1) — justifies β = 50
+- **λ spread clamp** (Section 11.10) — un-clamped vs clamped, stability across runs
+- **λ sensitivity** (trade-off AP vs AVR at different `STL_TARGET_FRAC`)
 
 ### 12.4 Inference Benchmark
 
@@ -803,8 +950,11 @@ git add . && git commit -m "description" && git push
 - Seed: `SEED = 42`, applied to `random`, `numpy`, `torch`, `torch.cuda`,
   `cudnn.deterministic = True`, `cudnn.benchmark = False`
 - Framework: Python 3.10, PyTorch (Kaggle default), torchvision
-- GPU: NVIDIA T4 (Kaggle) — note that `num_workers > 0` introduces minor
-  non-determinism in batch ordering across runs
+- GPU: NVIDIA T4 (Kaggle) for the baseline; local RTX 5070Ti for STL
+  fine-tuning after the Kaggle GPU quota was exhausted. Note that
+  `num_workers > 0` introduces minor non-determinism in batch ordering. The λ
+  calibration is also sampling-sensitive on few batches (Section 11.10) — hence
+  the spread clamp.
 - All hyperparameters in `config.py`
 - Training history logged to `history.csv`
 
