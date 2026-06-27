@@ -25,6 +25,11 @@ class WeightedMSELoss(nn.Module):
         return loss.sum() / (target_weight.sum() + 1e-6)
 
 
+def _loss_scalar(result):
+    """Estrae tensore scalare da WeightedMSELoss (scalare) o SkeletalTopologyLoss (tupla)."""
+    return result[0] if isinstance(result, tuple) else result
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     running = 0.0
@@ -32,7 +37,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         imgs, hms, weights = imgs.to(device), hms.to(device), weights.to(device)
         optimizer.zero_grad()
         out = model(imgs)
-        loss = criterion(out, hms, weights)
+        loss = _loss_scalar(criterion(out, hms, weights))
         loss.backward()
         optimizer.step()
         running += loss.item() * imgs.size(0)
@@ -46,7 +51,7 @@ def validate(model, loader, criterion, device):
     for imgs, hms, weights in tqdm(loader, desc="val", leave=False):
         imgs, hms, weights = imgs.to(device), hms.to(device), weights.to(device)
         out = model(imgs)
-        running += criterion(out, hms, weights).item() * imgs.size(0)
+        running += _loss_scalar(criterion(out, hms, weights)).item() * imgs.size(0)
     return running / len(loader.dataset)
 
 

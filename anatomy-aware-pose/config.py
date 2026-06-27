@@ -48,4 +48,4 @@ AVR_ANGLE_MIN_DEG    = 20.0   # floor angolare condiviso AVR e STL
 STL_FINE_TUNE_LR     = 3e-5   # era 1e-4: ridotto per evitare catastrophic forgetting da E04
 STL_TARGET_FRAC      = 0.1    # era 1.0: STL pesava 3:1 su heatmap (causa gaming)
 STL_NUM_EPOCHS       = 10
-STL_BETA             = 30     # soft_argmax piu' nitida, riduce gap train/eval
+STL_BETA             = 50     # beta=50: mediana gap 0.27 px, p95 3.2 (vs beta=30 p95=9.3); vedi analisi decoder gap cella 3d
