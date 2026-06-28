@@ -53,6 +53,18 @@ from anthropometric_constraints import (BONE_RATIOS, SYMMETRY_PAIRS,JOINT_ANGLE_
 # (ora documentazione del foreshortening atteso, non piu' confini hinge).
 BONE_SCALE = 1.35
 
+# SYM_SCALE: scala log-cosh del sotto-termine simmetria sx/dx (sotto-termine b).
+# Sostituisce la vecchia hinge quadratica + cap. Rationale: la hinge cresceva
+# quadraticamente oltre soglia, esplodendo sui casi di foreshortening estremo
+# (ratio 5-30) e generando gradienti enormi che deformavano pose corrette
+# (vedi failure analysis: ~63% delle violazioni gravi e' foreshortening 2D reale).
+# Con log-cosh la penalita' cresce ~lineare oltre soglia (robusta agli outlier):
+# a SYM_SCALE=1.5 il gradiente sui casi gravi (ratio 3-10) e' ~5x piu' dolce
+# della hinge, riducendo la deformazione del foreshortening senza perdere il
+# segnale sugli errori veri. La dead-zone a log(1.5) e' preservata (semantica AVR).
+# Piu' alto = piu' tollerante agli outlier.
+SYM_SCALE = 1.5
+
 
 def _logcosh(x):
     """log(cosh(x)) numericamente stabile (no overflow per |x| grande).
@@ -229,20 +241,23 @@ def bone_ratio_loss(coords, valid_mask):
             z = (log_ratio - log_nom) / BONE_SCALE
             losses.append(_masked_mean(_logcosh(z), mask))
 
-    # --- b) Simmetria sx/dx: hinge su |log(ratio)| in spazio log (4 regole) ---
-    # log(BONE_RATIO_THRESHOLD) = soglia: fires se max/min > 1.5, esattamente come l'AVR.
-    # Spazio log rende simmetrica la penalita' (ratio=2.0 e ratio=0.5 penalizzati uguale).
+    # --- b) Simmetria sx/dx: log-cosh su |log(ratio)| oltre soglia (4 regole) ---
+    # log(BONE_RATIO_THRESHOLD) = soglia: dead-zone fino a max/min = 1.5, esattamente
+    # come l'AVR. Spazio log rende simmetrica la penalita' (ratio=2.0 e ratio=0.5
+    # penalizzati uguale). Oltre soglia: log-cosh invece della vecchia hinge^2+cap,
+    # cosi la penalita' cresce ~lineare e NON esplode sul foreshortening estremo
+    # (vedi SYM_SCALE e failure analysis). La dead-zone via relu preserva il
+    # legame con l'AVR; il gradiente sui casi gravi e' ~5x piu' dolce della hinge.
     LOG_SYM_THRESHOLD = math.log(BONE_RATIO_THRESHOLD)
-    SYMMETRY_CAP = 4.0
     for (left_a, left_b), (right_a, right_b), _ in SYMMETRY_PAIRS:
         mask = _kp_valid(valid_mask, left_a, left_b, right_a, right_b)
         len_left  = _bone_length(coords, left_a,  left_b)
         len_right = _bone_length(coords, right_a, right_b)
         ratio = len_left / (len_right + 1e-6)
         log_ratio = torch.log(ratio + 1e-6)
-        penalty = torch.clamp(F.relu(log_ratio.abs() - LOG_SYM_THRESHOLD) ** 2,
-                              max=SYMMETRY_CAP)
-        losses.append(_masked_mean(penalty, mask))      
+        excess = F.relu(log_ratio.abs() - LOG_SYM_THRESHOLD)  # dead-zone come l'AVR
+        penalty = _logcosh(excess / SYM_SCALE)                # robusta agli outlier
+        losses.append(_masked_mean(penalty, mask))
 
     if not losses:
         return torch.tensor(0.0, device=coords.device)
