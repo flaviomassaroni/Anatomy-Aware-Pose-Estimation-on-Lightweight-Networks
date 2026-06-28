@@ -1,1 +1,24 @@
-dataset/
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Dataset e annotazioni pesanti (stanno su Kaggle, MAI su Git)
+data/
+datasets/
+*.zip
+anatomy-aware-pose/datasets/
+anatomy-aware-pose/config-local.py
+anatomy-aware-pose/local_config.py
+
+# Checkpoint / pesi / output (stanno su Kaggle, NON su Git)
+*.ckpt
+checkpoints/
+eval_results/
+*_pred.json
+history.csv
