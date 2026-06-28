@@ -59,11 +59,12 @@ BONE_SCALE = 1.35
 # (ratio 5-30) e generando gradienti enormi che deformavano pose corrette
 # (vedi failure analysis: ~63% delle violazioni gravi e' foreshortening 2D reale).
 # Con log-cosh la penalita' cresce ~lineare oltre soglia (robusta agli outlier):
-# a SYM_SCALE=1.5 il gradiente sui casi gravi (ratio 3-10) e' ~5x piu' dolce
-# della hinge, riducendo la deformazione del foreshortening senza perdere il
-# segnale sugli errori veri. La dead-zone a log(1.5) e' preservata (semantica AVR).
-# Piu' alto = piu' tollerante agli outlier.
-SYM_SCALE = 1.5
+# a SYM_SCALE=0.7 il gradiente sugli errori medi (ratio 1.7-2.0) e' ~uguale alla
+# hinge (conserva la spinta utile che dava il calo a E1), mentre smorza gli
+# outlier (ratio 5-20, foreshortening): hinge/8b sale da ~1x a ~2.7x.
+# (Nota: SYM_SCALE=1.5 ammorbidiva troppo, indebolendo anche la spinta utile.)
+# Piu' basso = piu' vicino alla hinge; piu' alto = piu' tollerante agli outlier.
+SYM_SCALE = 0.7
 
 
 def _logcosh(x):
