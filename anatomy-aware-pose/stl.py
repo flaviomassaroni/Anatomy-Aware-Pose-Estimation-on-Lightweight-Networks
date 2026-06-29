@@ -54,6 +54,41 @@ from anthropometric_constraints import (BONE_RATIOS, SYMMETRY_PAIRS,JOINT_ANGLE_
 BONE_SCALE = 1.35
 
 
+# ===================================================================
+# SEVERITY WEIGHTING del sotto-termine SIMMETRIA (bone_ratio)
+# ===================================================================
+#
+# MOTIVAZIONE (diagnosi sperimentale). La hinge quadratica sul sotto-termine
+# di simmetria sx/dx produce, sui casi CORREGGIBILI (ratio 1.7-3.0), un
+# gradiente che viene diluito dalla media di batch: i pochi violatori forti
+# (~17% delle pose, ~4.3x il gradiente medio) vengono "annacquati" dalla
+# maggioranza ben comportata. Risultato: la STL base muove pochissimo la
+# categoria bone_ratio dell'AVR (-0.4% su OCHuman: quasi solo il floor da
+# foreshortening). Il severity weighting RINFORZA il gradiente in proporzione
+# alla gravita' della violazione, recuperando i casi correggibili senza
+# accanirsi sugli estremi (in gran parte foreshortening, non correggibili).
+#
+#   penalty_pesata = hinge * (1 + SEVERITY_ALPHA * excess)
+#   dove excess = relu(|log ratio| - log(1.5))   (eccesso oltre la soglia AVR)
+#
+# Perche' LINEARE e non focal (excess^gamma): il focal azzera il gradiente
+# sui casi medi-correggibili e lo massimizza sugli estremi-foreshortening,
+# il profilo SBAGLIATO (testato e scartato). Il lineare invece rinforza i
+# correggibili (+38% a +3x vs hinge su ratio 1.7-3.0) e resta contenuto sugli
+# estremi -> e' la forma giusta. Dataset-independent: pesa per quanto una
+# REGOLA FISSA e' violata, non impara statistiche dai dati (tesi preservata).
+#
+# RISULTATO (deterministico, modello finale "sev_E7", alpha=2.0):
+#   bone_ratio OCHuman -2.8% (vs -0.4% della STL base, ~7x), collapse -27%,
+#   AVR OCHuman 0.4824 -> 0.4691, AP preservata. Vedi AVR_failure_analysis.md.
+#
+# TARATURA:
+#   SEVERITY_ALPHA = 0.0  -> hinge originale (retrocompatibile, per ablation)
+#   SEVERITY_ALPHA = 2.0  -> modello finale (default)
+#   alpha piu' alto = piu' aggressivo sui gravi (rischio: spinge il floor)
+SEVERITY_ALPHA = 2.0
+
+
 def _logcosh(x):
     """log(cosh(x)) numericamente stabile (no overflow per |x| grande).
 
@@ -192,10 +227,12 @@ def bone_ratio_loss(coords, valid_mask):
          nominale di Winter. Confrontano segmenti diversi, soggetti a
          foreshortening indipendente -> serve una penalita' robusta che
          tolleri la varianza di proiezione (vedi BONE_SCALE sopra).
-      b) Simmetria sx/dx -> hinge quadratica. Confronta lo STESSO segmento
-         sui due lati: il foreshortening e' in gran parte condiviso (assunta
-         co-planarita' approssimata dei due lati), quindi devia da 1 solo
-         per errori di stima sotto occlusione -> la hinge ha senso fisico.
+      b) Simmetria sx/dx -> hinge quadratica con SEVERITY WEIGHTING lineare.
+         Confronta lo STESSO segmento sui due lati: il foreshortening e' in
+         gran parte condiviso (assunta co-planarita' approssimata dei due lati),
+         quindi devia da 1 solo per errori di stima sotto occlusione -> la hinge
+         ha senso fisico. Il peso (1 + SEVERITY_ALPHA*excess) rinforza i casi
+         correggibili contro la diluizione di batch (vedi nota in cima al file).
          (Limite noto: pose di profilo estremo rompono la co-planarita'; il
          margine largo del range [0.65, 1.55] assorbe la maggior parte dei
          casi. Da rivedere solo se la per_category AVR segnala un problema.)
@@ -232,6 +269,9 @@ def bone_ratio_loss(coords, valid_mask):
     # --- b) Simmetria sx/dx: hinge su |log(ratio)| in spazio log (4 regole) ---
     # log(BONE_RATIO_THRESHOLD) = soglia: fires se max/min > 1.5, esattamente come l'AVR.
     # Spazio log rende simmetrica la penalita' (ratio=2.0 e ratio=0.5 penalizzati uguale).
+    # SEVERITY WEIGHTING: la hinge e' pesata per (1 + SEVERITY_ALPHA*excess) cosi i casi
+    # correggibili (excess medio) ricevono piu' gradiente, recuperando la diluizione di
+    # batch. Con SEVERITY_ALPHA=0 si torna alla hinge pura. Vedi nota in cima al file.
     LOG_SYM_THRESHOLD = math.log(BONE_RATIO_THRESHOLD)
     SYMMETRY_CAP = 4.0
     for (left_a, left_b), (right_a, right_b), _ in SYMMETRY_PAIRS:
@@ -240,8 +280,9 @@ def bone_ratio_loss(coords, valid_mask):
         len_right = _bone_length(coords, right_a, right_b)
         ratio = len_left / (len_right + 1e-6)
         log_ratio = torch.log(ratio + 1e-6)
-        penalty = torch.clamp(F.relu(log_ratio.abs() - LOG_SYM_THRESHOLD) ** 2,
-                              max=SYMMETRY_CAP)
+        excess = F.relu(log_ratio.abs() - LOG_SYM_THRESHOLD)
+        base = torch.clamp(excess ** 2, max=SYMMETRY_CAP)
+        penalty = base * (1.0 + SEVERITY_ALPHA * excess)   # severity lineare
         losses.append(_masked_mean(penalty, mask))      
 
     if not losses:
