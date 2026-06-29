@@ -268,7 +268,53 @@ to the heatmap resolution (64×48). The overall stride from input to heatmap is
 
 ## 7. Training
 
-### 7.1 Loss: WeightedMSELoss (`train.py`)
+Training happens in **two distinct stages**. This is the single most important
+thing to understand about the project, and the easiest to lose track of.
+
+### 7.0 Two stages: baseline pretrain → STL fine-tune
+
+```
+Stage 1  (DONE)                        Stage 2  (current work)
+─────────────────                      ───────────────────────
+COCO + WeightedMSELoss                 best.pth  +  STL terms
+30 epochs, from scratch                10 epochs, LR 3e-5
+Adam lr=1e-3, MultiStepLR              start from Stage-1 weights
+        │                                       │
+        ▼                                       ▼
+    best.pth                              best_stl.pth
+ AP 0.498 / AVR 0.306              (+ epoch_NN.pth per epoch)
+```
+
+**Stage 1 — Baseline, no STL (already complete).** We trained `PoseMobileNet`
+from scratch on COCO for 30 epochs with the heatmap `WeightedMSELoss` only — no
+anatomical constraints. The product is **`best.pth`**, the checkpoint with the
+lowest validation loss, scoring **AP = 0.498, AVR = 0.306** on COCO val. This is
+the baseline. In the runner notebook this is cell `4a`, kept behind `if False:`
+because it must **not** be re-run — its output `best.pth` already exists.
+
+**Stage 2 — STL fine-tuning (current).** We do **not** retrain from scratch.
+We **load `best.pth`** — a model already good at pose estimation — and fine-tune
+it for a few epochs with the Skeletal Topology Loss added to the heatmap loss, at
+a much lower learning rate (3e-5). The goal is not to raise AP (already good) but
+to **lower AVR** (fewer anatomically impossible poses) without damaging AP. The
+product is `best_stl.pth`; `best.pth` stays untouched and serves as the
+comparison baseline in the final evaluation cell.
+
+**Why fine-tune instead of training from scratch with the STL?**
+- **Cost:** Stage 1 is 30 epochs over 116k images. Re-running it for every λ
+  change would be prohibitive; Stage 2 is 10 short epochs.
+- **Clean ablation:** starting both arms from the *same* `best.pth` means any
+  difference in results is attributable to the STL alone, not to a different
+  random initialization. This is exactly what makes "baseline vs baseline+STL"
+  a valid ablation.
+
+**Consequence for the learning rate.** Fine-tuning *already-converged* weights is
+delicate: too high an LR causes catastrophic forgetting (the model unlearns
+Stage 1 and AP collapses). This is precisely why the first STL run failed at
+LR 1e-4 (Section 11.9) and why Stage 2 uses 3e-5. It is also why a 1-epoch sanity
+check (Section 12.1) is run before committing to the full schedule.
+
+### 7.1 Stage 1 — Loss: WeightedMSELoss (`train.py`)
 
 Per-pixel MSE between predicted and ground-truth heatmaps, with per-keypoint
 weighting:
@@ -290,13 +336,13 @@ heatmap-based pose estimation (SimpleBaseline, HRNet, ViTPose all use it). The
 Gaussian shape of the target means MSE naturally penalizes predictions near the
 peak more than those far away.
 
-### 7.2 Optimizer and scheduler
+### 7.2 Stage 1 — Optimizer and scheduler
 
 - **Adam** with initial lr = 1e-3
 - **MultiStepLR**: lr drops ×0.1 at epoch 15 and 25
 - 30 epochs total
 
-### 7.3 Checkpointing and resume (`train.fit`)
+### 7.3 Stage 1 — Checkpointing and resume (`train.fit`)
 
 Every epoch saves:
 - `last.pth` — full state (model + optimizer + scheduler + epoch + val_loss),
@@ -308,6 +354,18 @@ and resumes from the next epoch. This is critical on Kaggle where sessions can
 die mid-training.
 
 A `history.csv` is written at the end with per-epoch metrics.
+
+### 7.4 Stage 2 — STL fine-tuning
+
+The Stage-2 loop does not use `train.fit` (which selects on val_loss). It lives
+in the runner notebook (cell `4b`) and differs in three ways: it loads
+`best.pth` as starting point, it selects checkpoints on **AP** rather than
+val_loss (minimizing a loss that *includes* the STL would reward a low-STL model
+even if AP regressed), and it calibrates the per-term λ weights by gradient norm
+before training. The full rationale — soft-argmax bridge, the four loss terms,
+β = 50, λ calibration with spread clamp, and the post-mortem of the first failed
+run — is in **Section 11 (STL Implementation)**. Hyperparameters live in
+`config.py`: `STL_FINE_TUNE_LR`, `STL_TARGET_FRAC`, `STL_NUM_EPOCHS`, `STL_BETA`.
 
 ---
 
@@ -548,6 +606,13 @@ Key observations:
   poses on OCHuman have at least one anatomical violation.
 - This confirms the core thesis: AP alone does not capture anatomical
   plausibility. A robot trusting these poses would plan unsafe trajectories.
+
+> **STL result preview.** Fine-tuning with the Skeletal Topology Loss lowers the
+> AVR with AP preserved (deterministic, best model A_pure_E8): COCO 0.3065 → 0.3016
+> (−0.0049), OCHuman zero-shot 0.4824 → 0.4745 (−0.0079). The gain is modest in
+> aggregate — bone_ratio is capped by a 2D foreshortening floor — but joint_angle
+> (−9%) and collapse (−19%) drop substantially on OCHuman. See Section 11.11 for
+> the full result, the floor diagnosis, the non-determinism caveat, and tuning.
 
 ---
 
@@ -868,19 +933,123 @@ This is also a free diagnosis for the paper: terms with near-zero baseline
 gradient norm (collapse) are constraints the baseline already respects; terms
 with large norm (order, bone) are where violations exist and the STL will act.
 
+### 11.11 STL Results, Diagnosis of the Floor, and Tuning
+
+With the harness fixed (β=50, LR 3e-5, gradient-norm λ, AP-based selection), the
+STL fine-tuning was run from `best.pth`. This section records the working result,
+why the AVR cannot be driven arbitrarily low, and the tuning experiments. A
+fuller standalone write-up lives in `AVR_failure_analysis.md`.
+
+**Final result — deterministic (best model: A_pure_E8, LR 1e-5, boost 5×).** After
+discovering ~0.01 AVR non-determinism in the original pipeline, all final numbers
+were re-measured deterministically (fixed seed, `num_workers=0`). Baseline vs
+A_pure_E8:
+
+| | AP | AVR rate |
+|---|------|----------|
+| COCO val | 0.4984 → 0.4969 (−0.0014) | 0.3065 → **0.3016** (−0.0049) |
+| OCHuman zero-shot | 0.4364 → 0.4358 (−0.0006) | 0.4824 → **0.4745** (−0.0079) |
+
+The gain is small but **reproducible** (two independent configs agree under
+deterministic measurement) and AP is preserved. The historical E1 = 0.2875 was
+non-deterministic noise. The aggregate AVR is capped by the foreshortening floor on
+its dominant category (bone_ratio), but the per-category split on OCHuman shows the
+STL works where there is no 2D floor — **joint_angle −9%** (0.099 → 0.090) and
+**collapse −19%** (0.035 → 0.028), while bone_ratio barely moves (0.559 → 0.556).
+AVR-mean drops 0.693 → 0.675 on OCHuman. The improvement transfers **zero-shot**
+(trained on COCO only), confirming the central thesis: literature-based,
+dataset-independent constraints generalize cross-dataset (the differentiation from
+Han et al., who learn constraints from the training distribution). AP-preserving
+safety gain — the key message for HRI.
+
+**Why the AVR cannot go to zero — the foreshortening floor.** Five diagnostics
+(C–E in the analysis doc) eliminated three suspected causes and isolated two:
+
+1. The STL/AVR *gate mismatch* (STL masks on annotated keypoints, AVR on
+   confident predicted ones) is **not** the bottleneck: 70% of violations are on
+   keypoints the STL already sees.
+2. The *read-out gap* (soft-argmax vs argmax) is **not** the cause at β=50: the
+   gap on violating keypoints (median 0.26 px) equals the global reference.
+3. **Foreshortening floor (confirmed).** Of the severe bone_ratio violations
+   (ratio > 2.0, which are 43% of all in-gate violations), **63%** are
+   geometrically consistent with a limb projected toward the camera — a real 2D
+   asymmetry, not an error. The symmetry term assumes left/right coplanarity;
+   forcing symmetry on these would push a *correct* keypoint to a wrong position.
+   This is an intrinsic floor of a 2D anatomical metric and should be reported as
+   such: a non-zero bone_ratio AVR is expected even for a perfect 2D predictor.
+4. **Gradient dilution (correctable).** Poses with a severe violation carry
+   ~4.3× the batch-average bone gradient but are only ~17% of poses, so batch-mean
+   averaging dilutes them. Raising `lambda_bone` (the L1 fix) addresses this.
+
+**Why training stops helping after epoch 1.** The trajectory has a minimum at E1
+then rebounds (E1 0.2875 → E2 0.2903 → E3 0.3430). Mechanism: the symmetry loss
+first corrects the large, easy *errors* (Group 1: equalizing sides = moving
+toward truth), which dominate the early gradient; once exhausted, later epochs are
+dominated by *foreshortening* asymmetries (Group 2), where equalizing degrades a
+correct pose. The rebound is the price of the E1 success, not a defect — so the
+practical rule is **select the checkpoint at E1**, not run longer.
+
+**Ablation — log-cosh symmetry term (negative result).** We tested replacing the
+squared-hinge symmetry sub-term with a dead-zoned log-cosh (robust to outliers),
+expecting it to tolerate foreshortening. It **degrades** at every scale tried
+(SYM_SCALE 1.5 → best AVR 0.3034; 0.7 → 0.3156; both worse than the hinge's
+0.2875). The hinge works *because* it is aggressive: its squared growth gives a
+strong early push on correctable errors, and its cap already zeroes the gradient
+on extreme outliers (pure foreshortening). Softening the term removes the early
+push. Conclusion: **keep the hinge.** If the loss shape is changed, it should
+*sharpen* the signal on correctable errors (severity weighting), not smooth it.
+
+**Tuning — LR / boost / warmup grid (small gains, with a determinism caveat).** A
+5-config grid (LR 3e-5 vs 1e-5; boost 5× vs 3×; warmup on/off), same hinge, shared
+λ calibration, 3 epochs each. A methodological finding: the reference config gave
+0.2993 here vs 0.2875 in the original run — *same config, different result*. Cause:
+`num_workers>0` + train shuffle + non-deterministic cuDNN cause ~0.01 AVR noise
+between runs. Read against the **in-grid** reference (0.2993): lower LR (config A,
+0.2950) and warmup (config D, 0.2968) both help; lower boost hurts (consistent
+with the log-cosh lesson). Crucially, A's minimum was at E3 *without rebound* —
+the descent had not finished, motivating an extended deterministic run.
+
+**Extended deterministic runs + final comparison.** Config A (LR 1e-5, boost 5×)
+and A+warmup, re-run for 8 epochs deterministically, then all checkpoints
+re-evaluated with `num_workers=0` on both datasets. Final comparison:
+
+| model | COCO AP | COCO AVR | OC AP | OC AVR | OC AVR-mean |
+|-------|---------|----------|-------|--------|-------------|
+| baseline | 0.4984 | 0.3065 | 0.4364 | 0.4824 | 0.6928 |
+| **A_pure_E8** | 0.4969 | **0.3016** | 0.4358 | **0.4745** | **0.6749** |
+| A+warmup_E1 | 0.4976 | 0.3013 | 0.4373 | 0.4803 | 0.6896 |
+
+**A_pure_E8 is the final model.** On COCO the two configs tie (~−0.005 AVR); on
+OCHuman A_pure generalizes ~4× better (−0.0079 vs −0.0021). Warmup is a dead end
+(marginal OCHuman gain, bone_ratio slightly worse than baseline). The historical
+0.2875 did not reproduce — it was a ~0.01 noise fluctuation; the deterministic COCO
+gain is −0.0049. Per-category on OCHuman (A_pure_E8): bone_ratio −0.4%
+(floor-limited), **joint_angle −9%**, **collapse −19%** — the STL is effective on
+the constraints the 2D foreshortening floor does not cap.
+
+**Status: dynamics tuning exhausted.** LR/boost/warmup cannot move the bone_ratio
+floor. A_pure_E8 is the deliverable: small, reproducible, AP-preserving,
+generalizing zero-shot. For a larger gain the remaining levers are severity
+weighting of the symmetry sub-term (#6) and foreshortening/occlusion augmentation
+(#5).
+
 ---
 
 ## 12. Still To Do
 
-### 12.1 STL Training run
+### 12.1 STL Training run — DONE (final model: A_pure_E8)
 
-The harness is now fixed (Section 11.9–11.10): β = 50, LR = `STL_FINE_TUNE_LR`
-(3e-5), λ from gradient-norm calibration with spread clamp, selection on AP (not
-val_loss), all four terms including collapse. What remains is to **run** the
-fine-tuning from `best.pth` and read the result. Protocol: start with 1 epoch as
-a sanity check (AP must hold within ~1 point of 0.498, AVR must drop below
-0.306), then run the full schedule. Per-epoch checkpoints are saved so the
-AP/AVR trade-off can be inspected by hand.
+Complete. The fine-tuning was run, made deterministic, characterized, and the
+final model selected: **A_pure_E8** (LR 1e-5, boost 5×, epoch 8). Deterministic
+result: COCO AVR 0.3065 → 0.3016 (−0.0049), OCHuman zero-shot 0.4824 → 0.4745
+(−0.0079), AP preserved on both. The gain is small in aggregate (bone_ratio
+floor-limited) but concentrated in joint_angle (−9%) and collapse (−19%) on
+OCHuman. The historical 0.2875 was shown to be non-deterministic noise; dynamics
+tuning (LR/boost/warmup) is exhausted. The harness fixes all hold (β=50, LR 3e-5
+base, gradient-norm λ, AP-based selection, fixed seed + `num_workers=0`). For a
+larger gain, two levers remain open: severity weighting of the symmetry sub-term
+(#6) and foreshortening/occlusion augmentation (#5), the latter already in the
+paper's declared scope.
 
 ### 12.2 Grad-CAM Explainability
 
