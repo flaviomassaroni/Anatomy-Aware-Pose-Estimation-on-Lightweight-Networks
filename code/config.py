@@ -19,10 +19,12 @@ import torch
 
 # --- Ancora: cartella che contiene questo config.py ---
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DATA = os.path.join(_HERE, "datasets")
+# POSE_DATA_DIR sovrascrive il dataset root locale (utile su macchine con path diversi).
+# Default: code/datasets/ accanto ai moduli .py.
+_DATA = os.environ.get("POSE_DATA_DIR", os.path.join(_HERE, "..", "datasets"))
 
 # --- Rilevamento ambiente ---
-# Priorita': override esplicito via env var, poi presenza di ./datasets/,
+# Priorita': override esplicito via env var, poi presenza di POSE_DATA_DIR o ./datasets/,
 # poi presenza di /kaggle/input. Default prudente: kaggle.
 _forced = os.environ.get("POSE_ENV", "").strip().lower()
 if _forced in ("local", "kaggle"):
