@@ -6,14 +6,13 @@ NON stretch, perche' la STL ragiona su rapporti ossei e angoli.
 """
 import os
 import numpy as np
-import cv2
 import torch
 from torch.utils.data import Dataset
 from pycocotools.coco import COCO
+import cv2
 
 from utils import generate_heatmap
 
-import cv2
 cv2.setNumThreads(0)  # evita thread contention con DataLoader num_workers > 0
 
 

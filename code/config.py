@@ -96,10 +96,9 @@ BONE_RATIO_THRESHOLD = 1.5    # soglia max/min per simmetria ossea (AVR + STL)
 COLLAPSE_THRESHOLD   = 0.10   # segmento/torso minimo (AVR + STL)
 MIN_CONF             = 0.3    # confidenza minima per l'AVR (score heatmap)
 AVR_ANGLE_MIN_DEG    = 20.0   # floor angolare condiviso AVR e STL
-STL_FINE_TUNE_LR     = 1e-5   # sev_E7: abbassato da 3e-5 (run std 4b) a 1e-5 per severity run
+STL_FINE_TUNE_LR     = 1e-5   # LR basso: evita catastrophic forgetting sul backbone
 STL_TARGET_FRAC      = 0.1    # rho: frazione della spinta heatmap a cui portare ogni termine
-STL_NUM_EPOCHS       = 10
-STL_BETA             = 50     # beta=50: mediana gap 0.27 px, p95 3.2 (vs beta=30 p95=9.3); vedi analisi decoder gap
+STL_BETA             = 50     # temperatura soft-argmax: gap mediano 0.27 px, p95 3.2 px con sigma=2
 STL_BONE_BOOST       = 5.0    # moltiplicatore bone loss nel run sev_E7
 STL_SEV_EPOCHS       = 8      # numero epoche run sev (checkpoint selezionato a E7)
 SEVERITY_ALPHA       = 2.0    # peso severity weighting (0.0 = hinge pura); vedi stl.py
