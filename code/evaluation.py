@@ -1,5 +1,4 @@
 """Evaluation: inferenza, AP/AR (pycocotools), AVR (custom), wrapper COCO/OCHuman.
-Sezione 'Evaluation' della struttura richiesta dalla prof.
 """
 import json
 import os
@@ -15,9 +14,6 @@ from utils import decode_heatmaps, heatmap_to_original
 from data import build_samples, COCOEvalDataset
 
 
-# ============================================================
-# Inferenza
-# ============================================================
 def run_inference(model, samples, img_dir, device, batch_size=32, num_workers=0):
     """Gira il modello su tutti i sample. Ritorna:
     - coco_results: lista di dict in formato COCO results (per AP/AR)
@@ -52,16 +48,12 @@ def run_inference(model, samples, img_dir, device, batch_size=32, num_workers=0)
     return coco_results, coords_all, scores_all
 
 
-# ============================================================
-# AP / AR via pycocotools (richiede la ground truth -> OKS)
-# ============================================================
 def run_coco_eval(coco_results, ann_file, results_path):
     with open(results_path, 'w') as f:
         json.dump(coco_results, f)
     coco_gt = COCO(ann_file)
     coco_dt = coco_gt.loadRes(results_path)
     coco_eval = COCOeval(coco_gt, coco_dt, iouType='keypoints')
-    # valuta solo sulle immagini per cui abbiamo prodotto predizioni
     coco_eval.params.imgIds = sorted(list(set(r['image_id'] for r in coco_results)))
     coco_eval.evaluate()
     coco_eval.accumulate()
@@ -69,16 +61,13 @@ def run_coco_eval(coco_results, ann_file, results_path):
     return coco_eval
 
 
-# ============================================================
-# AVR - Anatomical Violation Rate (custom, NON usa la ground truth)
-# ============================================================
 KP_NAMES = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
             'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
             'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
             'left_knee', 'right_knee', 'left_ankle', 'right_ankle']
 KP_IDX = {name: i for i, name in enumerate(KP_NAMES)}
 
-# coppie di ossa simmetriche sx/dx
+
 SYMMETRIC_BONE_PAIRS = [
     (('left_shoulder', 'left_elbow'), ('right_shoulder', 'right_elbow')),
     (('left_elbow', 'left_wrist'),    ('right_elbow', 'right_wrist')),
@@ -159,9 +148,6 @@ def evaluate_avr(coords_list, scores_list):
     }
 
 
-# ============================================================
-# Wrapper di alto livello (le due funzioni che mancavano)
-# ============================================================
 def evaluate_on_coco_val(model, val_samples, device,
                          results_path=os.path.join(RESULTS_DIR, 'coco_val_pred.json')):
     """Inferenza + AP/AR + AVR su COCO val. Ritorna (coco_eval, avr_dict)."""

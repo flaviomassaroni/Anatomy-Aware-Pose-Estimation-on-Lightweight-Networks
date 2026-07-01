@@ -1,5 +1,4 @@
 """Network: MobileNetV3-Small + testa di deconvoluzione (17 heatmap).
-Sezione 'Network' della struttura richiesta dalla prof.
 """
 import torch
 import torch.nn as nn

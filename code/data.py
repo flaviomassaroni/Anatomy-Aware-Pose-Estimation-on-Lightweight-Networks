@@ -1,8 +1,6 @@
-"""Data: parsing annotazioni COCO/OCHuman e Dataset PyTorch.
-Sezione 'Data' della struttura richiesta dalla prof.
-
-Nota: usa aspect-ratio preserving resize (scala uniforme + padding centrato),
-NON stretch, perche' la STL ragiona su rapporti ossei e angoli.
+"""Data: parsing annotazioni COCO/OCHuman e Dataset PyTorch. Sezione 'Data'.
+Resize aspect-ratio preserving (scala uniforme + padding centrato): la STL
+ragiona su rapporti ossei, lo stretch li altererebbe.
 """
 import os
 import numpy as np

@@ -1,5 +1,4 @@
 """Utils: generazione/decodifica heatmap, conversione coordinate, conteggio parametri.
-Sezione 'Utils' della struttura richiesta dalla prof.
 """
 import numpy as np
 

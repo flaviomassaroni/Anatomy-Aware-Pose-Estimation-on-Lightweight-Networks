@@ -1,5 +1,4 @@
 """Train: loss pesata, ciclo di training, checkpointing.
-Sezione 'Train' della struttura richiesta dalla prof.
 """
 import os
 import time

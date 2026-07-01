@@ -1,9 +1,4 @@
-"""Test della STL: verifica differenziabilita' e sanity check.
-
-Lancia con:  python test_stl.py
-Deve stampare tutti OK. Se un gradcheck fallisce, il termine non e'
-correttamente differenziabile e non puo' essere usato in training.
-"""
+"""Test della STL: verifica differenziabilita' e sanity check."""
 
 import torch
 import stl as stl_module
@@ -22,8 +17,6 @@ def test_soft_argmax():
     B, K, H, W = 2, 17, 64, 48
     hm = torch.zeros(B, K, H, W, dtype=torch.float64, requires_grad=True)
 
-    # Piazza picchi in posizioni note per il primo sample
-    # keypoint 0 in (col=20, row=30), keypoint 1 in (col=10, row=40)
     with torch.no_grad():
         for b in range(B):
             for k in range(K):
@@ -48,8 +41,7 @@ def test_soft_argmax():
     print(f"  Coordinate keypoint 0, sample 0: x={coords[0,0,0]:.2f}, y={coords[0,0,1]:.2f}")
     print(f"  (atteso circa x=20.0, y=30.0)")
 
-    # Gradcheck: verifica numerica che il gradiente analitico sia corretto
-    # Usiamo un input piccolo per velocita'
+    # gradcheck su input piccolo: verifica che il gradiente analitico sia corretto
     hm_small = torch.randn(1, 3, 8, 6, dtype=torch.float64, requires_grad=True)
     func = lambda h: soft_argmax(h, beta=5.0).sum()
     ok = gradcheck(func, (hm_small,), eps=1e-4, atol=1e-3)
@@ -62,12 +54,9 @@ def test_bone_ratio():
     print("\n=== Test bone ratio loss ===")
 
     B, K = 2, 17
-    # Posa "perfetta": proporzioni da manuale (Winter 2009)
+    # Scheletro con proporzioni nominali Winter 2009
     coords = torch.zeros(B, K, 2, dtype=torch.float64, requires_grad=True)
     with torch.no_grad():
-        # Costruisci uno scheletro con proporzioni corrette
-        # Spalle a y=10, gomiti a y=10+18.6, polsi a y=10+18.6+14.6
-        # Anche a y=30, ginocchia a y=30+24.5, caviglie a y=30+24.5+24.6
         for b in range(B):
             coords.data[b, 5]  = torch.tensor([20.0, 10.0])   # left_shoulder
             coords.data[b, 6]  = torch.tensor([30.0, 10.0])   # right_shoulder
@@ -95,9 +84,8 @@ def test_bone_ratio():
     print(f"  Loss su posa rotta:   {loss_bad.item():.6f} (atteso: >> 0)")
     assert loss_bad > loss_good, "La posa rotta dovrebbe avere loss piu' alta!"
 
-    # Gradcheck (valid_gc senza requires_grad: gradcheck testa solo coords_gc)
     coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10
-    valid_gc = torch.ones(1, 17, dtype=torch.float64)
+    valid_gc = torch.ones(1, 17, dtype=torch.float64)  # no requires_grad: testa solo coords_gc
     ok = gradcheck(bone_ratio_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
     print(f"  Gradcheck bone_ratio_loss: {'OK' if ok else 'FALLITO'}")
     return ok
@@ -227,7 +215,6 @@ def test_collapse():
     print(f"  Loss ginocchio collassato: {loss_bad.item():.6f} (atteso: >> 0)")
     assert loss_bad > loss_ok, "Il ginocchio collassato dovrebbe avere loss piu' alta!"
 
-    # Gradcheck (valid_gc senza requires_grad: gradcheck testa solo coords_gc)
     coords_gc = torch.randn(1, 17, 2, dtype=torch.float64, requires_grad=True) * 10 + 5
     valid_gc = torch.ones(1, 17, dtype=torch.float64)
     ok = gradcheck(collapse_loss, (coords_gc, valid_gc), eps=1e-4, atol=1e-3)
